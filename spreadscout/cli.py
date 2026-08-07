@@ -1,6 +1,8 @@
 """Command line interface.
 
 Commands:
+    watch      poll for entry conditions and monitor open positions
+    regime     measured conditions right now, and whether they permit entry
     scan       screen the chain and print sized order tickets
     account    show equity, open risk, and daily-loss-limit status
     backtest   replay the selection rules over historical data
@@ -111,6 +113,15 @@ def cmd_scan(cfg: Config, args: argparse.Namespace) -> int:
           f"({hours:.1f}h)   equity {_fmt_money(equity)}   open risk {_fmt_money(open_risk)}")
     print(f"chain: {c['listed']} listed, {c['quotable']} quotable, {c['liquid']} pass liquidity "
           f"-> {c['put_spreads']} put / {c['call_spreads']} call / {c['condors']} condor candidates")
+    print(f"vol assumption: {result['vol_note']}")
+
+    from .regime import check_gates
+
+    gates = check_gates(result["regime"], cfg, now=datetime.now(ET))
+    if not gates.passed:
+        print("\nENTRY CONDITIONS NOT MET -- tickets below are shown for reference only:")
+        for block in gates.blocks:
+            print(f"  - {block}")
 
     if not result["candidates"]:
         print("\nNothing passed the filters. That is a valid answer -- widen the delta band or "
@@ -204,6 +215,51 @@ def cmd_explain(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_regime(cfg: Config, args: argparse.Namespace) -> int:
+    """Show what conditions look like right now, and whether they permit entry."""
+    from .regime import check_gates, measure, resolve_vol_multiplier
+    from .screener import load_chain, pick_expiration
+
+    client = _client(cfg)
+    now = datetime.now(ET)
+    expiration = pick_expiration(client, cfg.symbol, cfg.dte)
+    spot, _T, contracts = load_chain(client, cfg, expiration, now=now)
+    regime = measure(client, cfg, spot, contracts, now=now)
+
+    if regime is None:
+        print("could not measure the regime: no solvable ATM implied vol on this chain.")
+        return 1
+
+    print(f"{cfg.symbol} regime at {now:%Y-%m-%d %H:%M} ET\n")
+    for line in regime.describe():
+        print(f"  {line}")
+
+    multiplier, note = resolve_vol_multiplier(regime, cfg)
+    print(f"\n  vol assumption       {note}")
+
+    gates = check_gates(regime, cfg, now=now)
+    print(f"\n{'ENTRY PERMITTED' if gates.passed else 'ENTRY BLOCKED'}")
+    for note in gates.notes:
+        print(f"  + {note}")
+    for block in gates.blocks:
+        print(f"  - {block}")
+
+    if not gates.passed:
+        print(
+            "\nNo entry is the default answer, not a failure. Premium selling only pays "
+            "when implied vol is genuinely rich against what the index is realizing; "
+            "the rest of the time you are taking the tail risk for free."
+        )
+    return 0
+
+
+def cmd_watch(cfg: Config, args: argparse.Namespace) -> int:
+    from .watch import watch
+
+    print(BANNER)
+    return watch(_client(cfg), cfg, args)
+
+
 def cmd_backtest(cfg: Config, args: argparse.Namespace) -> int:
     from .backtest import run_backtest
 
@@ -238,6 +294,14 @@ def build_parser() -> argparse.ArgumentParser:
     e = sub.add_parser("explain", help="show the expectancy arithmetic")
     e.set_defaults(func=cmd_explain)
 
+    g = sub.add_parser("regime", help="measured conditions and whether they permit entry")
+    g.set_defaults(func=cmd_regime)
+
+    w = sub.add_parser("watch", help="poll for entry conditions and monitor open positions")
+    w.add_argument("--equity", type=float, help="size against this instead of the account")
+    w.add_argument("--once", action="store_true", help="run a single pass and exit")
+    w.set_defaults(func=cmd_watch)
+
     b = sub.add_parser("backtest", help="replay the selection rules over history")
     b.add_argument("--start")
     b.add_argument("--end")
@@ -261,7 +325,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.dte is not None:
         cfg.dte = args.dte
     if args.vol_multiplier is not None:
+        # Passing an explicit multiplier is a statement that you want *your*
+        # number used, so it also switches off the measured override that would
+        # otherwise silently replace it on the next poll.
         cfg.beliefs.vol_multiplier = args.vol_multiplier
+        cfg.beliefs.source = "manual"
     if args.sandbox:
         cfg.environment = "sandbox"
     cfg.validate()

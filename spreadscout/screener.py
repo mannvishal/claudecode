@@ -177,10 +177,31 @@ def annotate(ev: Evaluation, spot: float, T: float, contracts_asof: str | None) 
     return ev
 
 
-def screen(client: TradierClient, cfg: Config, now: datetime | None = None) -> dict:
-    """Run the full screen. Returns a result dict for the CLI to render."""
-    expiration = pick_expiration(client, cfg.symbol, cfg.dte)
-    spot, T, contracts = load_chain(client, cfg, expiration, now=now)
+def screen(
+    client: TradierClient,
+    cfg: Config,
+    now: datetime | None = None,
+    preloaded: tuple[date, float, float, list[OptionContract]] | None = None,
+) -> dict:
+    """Run the full screen. Returns a result dict for the CLI to render.
+
+    When ``cfg.beliefs.source`` is ``"measured"``, the variance risk premium is
+    measured from this same chain and the resulting vol multiplier is applied
+    before anything is scored -- so the expectancy figures reflect measured
+    conditions rather than a static guess. ``preloaded`` lets a caller that has
+    already fetched the chain (the watch loop) avoid paying for it twice.
+    """
+    from .regime import measure, resolve_vol_multiplier
+
+    if preloaded is not None:
+        expiration, spot, T, contracts = preloaded
+    else:
+        expiration = pick_expiration(client, cfg.symbol, cfg.dte)
+        spot, T, contracts = load_chain(client, cfg, expiration, now=now)
+
+    regime = measure(client, cfg, spot, contracts, now=now)
+    multiplier, vol_note = resolve_vol_multiplier(regime, cfg)
+    cfg.beliefs.vol_multiplier = multiplier
 
     quotable = [c for c in contracts if c.is_quotable]
     liquid = [c for c in quotable if _passes_liquidity(c, cfg)]
@@ -204,6 +225,9 @@ def screen(client: TradierClient, cfg: Config, now: datetime | None = None) -> d
         "spot": spot,
         "expiration": expiration,
         "years_to_expiry": T,
+        "contracts": contracts,
+        "regime": regime,
+        "vol_note": vol_note,
         "counts": {
             "listed": len(contracts),
             "quotable": len(quotable),

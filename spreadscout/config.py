@@ -65,15 +65,105 @@ class RiskConfig:
 
 @dataclass
 class BeliefConfig:
-    """Your forecast, stated explicitly.
+    """Your forecast about realized vs implied volatility.
 
-    ``vol_multiplier`` below 1.0 says you expect realized vol to come in under
-    implied. It is the only source of positive expected value in this strategy,
-    and the tool will not choose it for you -- see ``README.md``.
+    ``source`` decides where it comes from:
+
+    * ``"measured"`` (default) -- derive it from the trailing variance risk
+      premium, i.e. what the index has actually been realizing against what the
+      chain is charging. Replaces a guess with a measurement. Still a forecast,
+      because it assumes the trailing window describes tomorrow.
+    * ``"manual"`` -- use ``vol_multiplier`` verbatim. At the 1.0 default this
+      makes every candidate negative-EV and the tool will recommend nothing,
+      which is the correct answer to "is there free money here".
+
+    ``haircut`` is added to the measured multiplier before use, so a measured
+    0.82 with a 0.05 haircut is applied as 0.87. Trailing realized vol
+    systematically understates the risk of the day it stops being trailing, and
+    this is the knob that admits it.
     """
 
+    source: str = "measured"
     vol_multiplier: float = 1.0
+    haircut: float = 0.05
     drift: float | None = None
+
+
+@dataclass
+class GateConfig:
+    """Conditions that must hold before an entry is worth alerting on.
+
+    Every gate is a reason *not* to trade. The default posture is no, and
+    conditions have to argue past it.
+    """
+
+    # The premium actually on offer: implied / realized - 1.
+    #
+    # Calibration note, measured on 67 real SPX sessions: realized vol ran 13.7%
+    # close-to-close against 10.1% open-to-close, because roughly a third of the
+    # index's variance arrives overnight. Against a VIX-consistent 15.2% implied,
+    # that is a +10.8% premium on the conservative reading and +51% on the
+    # horizon-matched one. Which denominator you pick moves the answer by 5x, so
+    # both are always reported and the gate names the one it used.
+    #
+    # conservative_vrp=True compares against close-to-close, which is
+    # deliberately mismatched for a 0DTE seller who never carries the overnight
+    # gap. It is the stricter test and the default. Setting it False is the
+    # economically correct comparison for 0DTE and will fire far more often --
+    # which is a reason to raise min_variance_risk_premium at the same time, not
+    # a free upgrade.
+    min_variance_risk_premium: float = 0.15
+    conservative_vrp: bool = True
+
+    # Do not sell volatility that is already scraping its own floor.
+    min_vix_percentile: float = 0.20
+
+    # Do not sell into a move already underway.
+    max_todays_move_sigma: float = 1.25
+
+    # Entry window, ET. Outside it the quotes are wide (early) or there is too
+    # little time to manage a position that turns (late).
+    entry_start_hour: int = 10
+    entry_start_minute: int = 0
+    entry_end_hour: int = 14
+    entry_end_minute: int = 0
+
+    blackout_dates: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MonitorConfig:
+    """Thresholds for alerting on positions you already hold.
+
+    These matter more than the entry gates. A missed entry costs nothing; a
+    0DTE short strike going through the money costs the width.
+    """
+
+    short_delta_alert: float = 0.33
+    short_delta_critical: float = 0.45
+    # Alert when spot comes within this many index points of a short strike.
+    strike_proximity_points: float = 15.0
+    # Alert when a position's mark-to-market loss reaches this multiple of the
+    # credit taken in. 2.0 is the conventional stop for defined-risk sellers.
+    loss_multiple_alert: float = 2.0
+    # Warn as the daily loss limit is approached, not only once it is breached.
+    daily_loss_warn_fraction: float = 0.70
+    # Suppress entry suggestions while any open position is in critical trouble.
+    # Being run over is not the moment to add risk, and a tool that alerts a
+    # breach and then proposes a new condor in the same breath is training you
+    # to ignore the first half of its own output.
+    block_entry_on_critical: bool = True
+
+
+@dataclass
+class AlertConfig:
+    terminal_bell: bool = True
+    log_file: str | None = "alerts.jsonl"
+    webhook_url: str | None = None  # Slack or Discord incoming webhook
+    webhook_min_severity: str = "WARN"
+    cooldown_minutes: float = 15.0
+    poll_seconds: int = 60
+    heartbeat_minutes: float = 60.0
 
 
 @dataclass
@@ -88,6 +178,9 @@ class Config:
     costs: CostConfig = field(default_factory=CostConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     beliefs: BeliefConfig = field(default_factory=BeliefConfig)
+    gates: GateConfig = field(default_factory=GateConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
+    alerts: AlertConfig = field(default_factory=AlertConfig)
 
     @property
     def base_url(self) -> str:
@@ -121,6 +214,9 @@ class Config:
             "costs": CostConfig,
             "risk": RiskConfig,
             "beliefs": BeliefConfig,
+            "gates": GateConfig,
+            "monitor": MonitorConfig,
+            "alerts": AlertConfig,
         }
         for key, value in raw.items():
             if key in nested:
@@ -150,5 +246,15 @@ class Config:
             raise SystemExit("costs.fill_fraction must be in [0, 1]")
         if self.beliefs.vol_multiplier <= 0:
             raise SystemExit("beliefs.vol_multiplier must be positive")
+        if self.beliefs.source not in ("measured", "manual"):
+            raise SystemExit("beliefs.source must be 'measured' or 'manual'")
+        if self.beliefs.haircut < 0:
+            raise SystemExit("beliefs.haircut must be >= 0")
         if self.filters.min_short_delta >= self.filters.max_short_delta:
             raise SystemExit("filters.min_short_delta must be < max_short_delta")
+        if self.monitor.short_delta_alert >= self.monitor.short_delta_critical:
+            raise SystemExit("monitor.short_delta_alert must be < short_delta_critical")
+        if self.alerts.poll_seconds < 5:
+            raise SystemExit("alerts.poll_seconds must be >= 5 to stay inside rate limits")
+        if self.alerts.webhook_min_severity not in ("INFO", "WARN", "CRITICAL"):
+            raise SystemExit("alerts.webhook_min_severity must be INFO, WARN or CRITICAL")

@@ -43,16 +43,65 @@ risk:
 beliefs:
   # THE ONLY SOURCE OF EDGE IN THIS STRATEGY.
   #
-  # 1.00 means you think implied vol is a fair forecast of realized vol. At 1.00
-  # every candidate will show negative expected value after costs, and with
-  # require_positive_ev: true the tool will recommend nothing. That is correct
-  # behaviour, not a bug.
+  # source: measured  -- derive the vol assumption from the trailing variance
+  #                      risk premium: what the index has actually been
+  #                      realizing versus what the chain is charging. This
+  #                      replaces a guess with a measurement. It is still a
+  #                      forecast, because it assumes the trailing window
+  #                      describes tomorrow, and that assumption fails hardest
+  #                      on exactly the day it costs the most.
+  # source: manual    -- use vol_multiplier verbatim. At 1.00 every candidate
+  #                      shows negative EV after costs and the tool recommends
+  #                      nothing, which is the correct answer to "is there free
+  #                      money here".
+  source: measured
+  vol_multiplier: 1.00   # used when source is manual, or as the fallback
+  haircut: 0.05          # added to the measured multiplier, making it less
+                         # favourable. Trailing realized vol systematically
+                         # understates the day it stops being trailing.
+  # drift: null          # continuously-compounded expected index return;
+                         # defaults to risk_free_rate - dividend_yield
+
+gates:
+  # Conditions that must ALL hold before an entry is worth alerting on. Every
+  # gate is a reason not to trade; the default posture is no.
   #
-  # Below 1.00 means you expect realized to come in under implied -- the variance
-  # risk premium. Historically that has averaged somewhere around 0.85 on SPX,
-  # but the average is taken over the crash days, not instead of them, and the
-  # premium is thinnest exactly when you most want it. Pick this number
-  # deliberately and write down why.
-  vol_multiplier: 1.00
-  # drift: null           # continuously-compounded expected index return;
-                          # defaults to risk_free_rate - dividend_yield
+  # Measured on 67 real SPX sessions: realized vol ran 13.7% close-to-close
+  # against 10.1% open-to-close, because about a third of the variance arrives
+  # overnight -- risk a 0DTE seller never carries. Against a VIX-consistent
+  # 15.2% implied that is +10.8% premium on the conservative reading and +51%
+  # on the horizon-matched one. Both are always reported; the gate names which
+  # it used. Do not raise the floor and lower conservative_vrp at the same time
+  # without understanding you have changed two things at once.
+  min_variance_risk_premium: 0.15
+  conservative_vrp: true
+
+  min_vix_percentile: 0.20      # do not sell vol that is already on the floor
+  max_todays_move_sigma: 1.25   # do not sell into a move already underway
+
+  entry_start_hour: 10          # ET. Before this the quotes are wide and the
+  entry_start_minute: 0         # opening direction is noise.
+  entry_end_hour: 14            # After this there is too little time left to
+  entry_end_minute: 0           # manage a position that turns against you.
+
+  blackout_dates: []            # e.g. ["2026-09-17"] for FOMC, CPI, NFP days
+
+monitor:
+  # Thresholds for positions you ALREADY HOLD. These matter more than the entry
+  # gates: a missed entry costs nothing, a breached 0DTE short strike costs the
+  # width of the spread.
+  short_delta_alert: 0.33       # WARN
+  short_delta_critical: 0.45    # CRITICAL
+  strike_proximity_points: 15.0 # alert when spot comes this close to a short
+  loss_multiple_alert: 2.0      # alert at 2x the credit taken in
+  daily_loss_warn_fraction: 0.70 # warn at 70% of the daily limit, not only at 100%
+
+alerts:
+  terminal_bell: true
+  log_file: alerts.jsonl        # JSON lines, so history survives the process
+  webhook_url: null             # Slack or Discord incoming webhook URL
+  webhook_min_severity: WARN    # INFO | WARN | CRITICAL
+  cooldown_minutes: 15.0        # repeats inside this window are suppressed;
+                                # CRITICAL alerts use a quarter of it
+  poll_seconds: 60
+  heartbeat_minutes: 60.0       # periodic "still watching, here is why not" note

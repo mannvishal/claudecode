@@ -1,11 +1,93 @@
 # spreadscout
 
-A screener for SPX 0DTE credit spreads and iron condors. It reads live chains
-from Tradier, recomputes the greeks itself, sizes positions against your account
-equity, and prints order tickets for you to review.
+Watches SPX 0DTE credit spreads and iron condors through the Tradier API. It
+measures whether conditions actually favour selling premium, alerts you when they
+do, monitors the positions you already hold, and sizes everything against your
+account equity.
 
 **It never places an order.** There is no order-placement code path anywhere in
-this repository — see [`tradier.py`](spreadscout/tradier.py).
+this repository — the broker client in [`tradier.py`](spreadscout/tradier.py) is
+read-only by construction. The only outbound POST in the package goes to a
+webhook URL you supply.
+
+---
+
+```bash
+spreadscout watch     # monitor open positions + alert when conditions permit entry
+spreadscout regime    # what conditions look like right now, and why
+```
+
+---
+
+## When is "the right time"?
+
+There is one defensible answer, and it is measurable rather than a matter of
+taste: **only when implied volatility is genuinely rich relative to what the
+index is actually realizing.** That gap — the variance risk premium — is the
+only thing a premium seller harvests. Strike selection, delta bands and widths
+shape your risk; they do not create return.
+
+So `spreadscout` measures it rather than asking you to guess. `spreadscout
+regime` reports what it sees:
+
+```
+realized (o->c)      10.07%   <- horizon-matched for 0DTE
+realized (c->c)      13.72%   <- includes overnight gaps you never hold
+ATM implied vol      15.20%
+variance risk prem.  +10.8% (conservative reading)
+
+ENTRY BLOCKED
+  - variance risk premium is +10.8% against close-to-close realized vol, below
+    the +15.0% floor (the open-to-close reading is +51.0%)
+```
+
+Those are real numbers from 67 SPX sessions. Note the spread between the two
+readings — roughly a third of the index's variance arrives overnight, which a
+0DTE seller never carries. Picking the denominator moves the measured premium by
+5×, so **both are always reported and the gate names which one it used.** A tool
+that showed you only the number that blocked would just be teaching you to
+disable it.
+
+### Entry gates
+
+All must pass. Each is a reason *not* to trade, and the default posture is no:
+
+| Gate | Default | Why |
+|---|---|---|
+| Variance risk premium | ≥ +15% | Below this there is nothing to harvest |
+| VIX percentile | ≥ 20th | Don't sell vol that is already on the floor |
+| Today's move | ≤ 1.25σ | Trend days are when short strikes get run over |
+| Time window | 10:00–14:00 ET | Early quotes are wide; late leaves no time to manage |
+| Blackout dates | — | Your own FOMC/CPI/NFP list |
+
+### Position monitoring matters more
+
+A missed entry costs nothing. A breached 0DTE short strike costs the width. So
+positions are checked **first on every pass**, before the chain is even fetched —
+a breach warning must never queue behind a slow request. There's a test that
+asserts that ordering.
+
+| Alert | Trigger |
+|---|---|
+| `CRITICAL` breach | Spot is through a short strike |
+| `CRITICAL` delta | Short leg delta ≥ 0.45 |
+| `WARN` delta | Short leg delta ≥ 0.33 |
+| `WARN` proximity | Spot within 15 pts of a short strike |
+| `WARN`/`CRITICAL` loss | Loss ≥ 2× the credit taken in |
+| `CRITICAL` guard | Daily loss limit hit — entries off for the session |
+
+Positions are marked at the side you'd have to cross to get out (pay the ask to
+close a short, hit the bid to close a long), because the cost of escaping is the
+one number you don't want flattered when deciding whether to escape.
+
+The daily-loss guard stops new entries but **keeps monitoring what you hold** —
+being down for the day is exactly when you most need the watcher and least need
+another position.
+
+Alerts go to console, a JSONL log, and optionally a Slack or Discord webhook.
+Repeats inside a cooldown are suppressed, with `CRITICAL` alerts repeating 4×
+sooner. A broken webhook can never silence the console — there's a test for that
+too, because a watcher you believe is running and isn't is worse than none.
 
 ---
 
@@ -42,9 +124,15 @@ from *your forecast* that realized volatility will come in below implied. It
 does not come from the strike selection, the delta band, the width, or the
 screener. Those change your risk profile. They do not create edge.
 
-So the tool makes you state the forecast explicitly, in `beliefs.vol_multiplier`,
-and reports expectancy under both measures side by side. At the default of 1.00
-it will recommend nothing at all. **That is correct behaviour, not a bug.**
+So the tool never lets that forecast be invisible. By default (`beliefs.source:
+measured`) it derives the multiplier from the measured variance risk premium
+described above and prints its provenance on every ticket — *"measured
+realized/implied = 0.90, +0.05 haircut → 0.95"*. Set `source: manual` and it uses
+your number verbatim; at the 1.00 default that means it recommends nothing at
+all. **That is correct behaviour, not a bug.**
+
+The haircut only ever makes the assumption worse, and can never push the
+multiplier above 1.00 — that would be a reason to *buy* premium, not sell it.
 
 ### Why the win rate is the trap
 
@@ -110,7 +198,7 @@ side cannot be assigned while the other is still open.
 pip install -e ".[dev]"
 cp .env.example .env          # add your Tradier token
 cp config.example.yaml spreadscout.yaml
-pytest                        # 103 tests
+pytest                        # 196 tests
 ```
 
 Get a token at <https://dash.tradier.com/settings/api>. Options chains with
@@ -126,13 +214,19 @@ are both gitignored.
 ## Use
 
 ```bash
+spreadscout watch                     # the main loop: monitor positions, alert on entries
+spreadscout watch --once              # a single pass, for testing your config
+spreadscout regime                    # measured conditions and whether they permit entry
 spreadscout scan                      # screen today's expiry, print sized tickets
-spreadscout scan --top 10 --show-rejected
-spreadscout explain                   # the expectancy arithmetic, worked through
 spreadscout account                   # equity, open risk, daily stop status
+spreadscout explain                   # the expectancy arithmetic, worked through
 spreadscout backtest --start 2024-01-01
-spreadscout scan --vol-multiplier 0.85   # state a forecast and see what changes
+spreadscout scan --vol-multiplier 0.85   # override the measurement with your own number
 ```
+
+`watch` polls every 60s by default. Run it under `screen`/`tmux` or as a systemd
+unit; it survives unexpected errors rather than dying silently, because a
+watcher you believe is running and isn't is worse than no watcher at all.
 
 `scan` warns when the market is closed — quotes outside session hours are stale
 closing prints and the modelled fills are not achievable against them.
@@ -162,6 +256,10 @@ is still worth knowing.
 | `tradier.py` | REST client — read-only by construction |
 | `screener.py` | Candidate construction, liquidity filters, ranking |
 | `risk.py` | Expectancy identity, sizing caps, daily-loss guard |
+| `regime.py` | Realized-vol measurement, variance risk premium, entry gates |
+| `monitor.py` | OCC parsing, position grouping, breach and loss alerts |
+| `alerts.py` | Routing, de-duplication, console/file/webhook sinks |
+| `watch.py` | The polling loop and its ordering guarantees |
 | `backtest.py` | Modelled historical replay |
 | `cli.py` | Commands |
 
