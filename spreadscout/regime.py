@@ -269,12 +269,20 @@ class GateResult:
 
 
 def check_gates(
-    regime: Regime | None, cfg: Config, now: datetime | None = None
+    regime: Regime | None,
+    cfg: Config,
+    now: datetime | None = None,
+    calendar: "EconCalendar | None" = None,
 ) -> GateResult:
     """Apply every entry condition. All must pass; each failure is named.
 
     Gates are deliberately phrased as reasons *not* to trade. The default state
     is "do not enter", and conditions have to argue their way past that.
+
+    ``calendar`` is optional so that callers which only want the volatility
+    gates -- and tests which do not want to touch the event seed -- can skip it.
+    When it is omitted no event checking happens at all, which is why the watch
+    loop always passes one.
     """
     now = now or datetime.now(ET)
     g = cfg.gates
@@ -346,5 +354,13 @@ def check_gates(
     today_iso = now.date().isoformat()
     if today_iso in set(g.blackout_dates):
         blocks.append(f"{today_iso} is in your configured blackout list")
+
+    # --- scheduled economic events ------------------------------------------
+    if calendar is not None:
+        from .events import check_event_gate
+
+        event_blocks, event_notes = check_event_gate(calendar, cfg, now=now)
+        blocks.extend(event_blocks)
+        notes.extend(event_notes)
 
     return GateResult(passed=not blocks, blocks=blocks, notes=notes)

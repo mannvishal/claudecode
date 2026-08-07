@@ -1,0 +1,78 @@
+# Bundled economic event seed.
+#
+# VERIFY THIS BEFORE RELYING ON IT. These dates were written from memory at
+# build time, not fetched from a live source. Check them against the official
+# schedules:
+#
+#   FOMC     https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+#   BLS      https://www.bls.gov/schedule/news_release/       (CPI, PPI, NFP)
+#   BEA      https://www.bea.gov/news/schedule                (GDP, PCE)
+#
+# `verified_through` is the horizon this file claims to cover. Once today is
+# past it, every provider reading this file reports itself STALE, and with
+# gates.require_event_calendar: true that blocks entry. That is deliberate: a
+# safety list which silently returns "no events" after it goes out of date is
+# worse than having no list, because an empty answer is indistinguishable from
+# a genuinely clear day and you stop checking.
+#
+# When you extend this file, move `verified_through` forward in the same edit.
+
+verified_through: 2026-12-31
+
+events:
+  # --- FOMC rate decisions -------------------------------------------------
+  # The statement lands at 14:00 ET on the second day of each two-day meeting,
+  # with the press conference at 14:30. This is the single most dangerous
+  # scheduled event for a 0DTE seller: it arrives mid-session, inside the entry
+  # window, while positions are open. The default -120/+90 minute blackout
+  # covers the run-up and the whipsaw that usually follows the press conference.
+  - date: 2026-01-28
+    time: "14:00"
+    name: FOMC rate decision
+    impact: high
+  - date: 2026-03-18
+    time: "14:00"
+    name: FOMC rate decision (with projections)
+    impact: high
+  - date: 2026-04-29
+    time: "14:00"
+    name: FOMC rate decision
+    impact: high
+  - date: 2026-06-17
+    time: "14:00"
+    name: FOMC rate decision (with projections)
+    impact: high
+  - date: 2026-07-29
+    time: "14:00"
+    name: FOMC rate decision
+    impact: high
+  - date: 2026-09-16
+    time: "14:00"
+    name: FOMC rate decision (with projections)
+    impact: high
+  - date: 2026-10-28
+    time: "14:00"
+    name: FOMC rate decision
+    impact: high
+  - date: 2026-12-09
+    time: "14:00"
+    name: FOMC rate decision (with projections)
+    impact: high
+
+  # --- CPI, PPI, PCE, GDP --------------------------------------------------
+  # Deliberately NOT seeded. CPI lands somewhere between roughly the 10th and
+  # the 15th with no rule tight enough to derive, and guessing would block an
+  # arbitrary quiet day while leaving the real one open -- the exact failure
+  # this gate exists to prevent. Copy the real dates from the BLS link above
+  # into your own file (gates.event_calendar_file) and add them here:
+  #
+  #   - date: 2026-09-11
+  #     time: "08:30"
+  #     name: CPI
+  #     impact: high
+  #
+  # Note that 08:30 releases print before the 10:00 entry window opens, so they
+  # mainly matter as a signal that the session's realized volatility is likely
+  # to run above what the trailing window implies. The Employment Situation
+  # report is derived automatically from the first-Friday rule and does not
+  # need to be listed here.

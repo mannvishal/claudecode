@@ -24,6 +24,7 @@ from .alerts import CRITICAL, INFO, WARN, Alert, AlertRouter, build_router
 from .config import Config
 from .monitor import check_positions
 from .pricing import ET
+from .events import EconCalendar, build_calendar
 from .regime import Regime, check_gates, measure, resolve_vol_multiplier
 from .risk import daily_loss_breached, realized_pnl_today, size_position
 from .screener import load_chain, pick_expiration, screen
@@ -142,6 +143,7 @@ def _screen_and_alert(
 def run_once(
     client: TradierClient, cfg: Config, router: AlertRouter, state: WatchState,
     account_id: str | None, equity_override: float | None, now: datetime | None = None,
+    calendar: EconCalendar | None = None,
 ) -> None:
     """One full pass. Exceptions are caught by the caller so the loop survives."""
     now = now or datetime.now(ET)
@@ -184,7 +186,7 @@ def run_once(
     spot, T, contracts = load_chain(client, cfg, expiration, now=now)
     preloaded = (expiration, spot, T, contracts)
     regime = measure(client, cfg, spot, contracts, now=now)
-    gates = check_gates(regime, cfg, now=now)
+    gates = check_gates(regime, cfg, now=now, calendar=calendar)
 
     multiplier, vol_note = resolve_vol_multiplier(regime, cfg)
     cfg.beliefs.vol_multiplier = multiplier
@@ -234,6 +236,7 @@ def run_once(
 
 def watch(client: TradierClient, cfg: Config, args) -> int:
     router = build_router(cfg)
+    calendar = build_calendar(cfg)
     now = datetime.now(ET)
     state = WatchState(day=now.date())
 
@@ -256,7 +259,7 @@ def watch(client: TradierClient, cfg: Config, args) -> int:
 
     while True:
         try:
-            run_once(client, cfg, router, state, account_id, args.equity)
+            run_once(client, cfg, router, state, account_id, args.equity, calendar=calendar)
         except TradierError as exc:
             log.warning("poll failed, will retry: %s", exc)
         except KeyboardInterrupt:

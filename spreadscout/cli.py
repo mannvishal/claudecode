@@ -117,7 +117,10 @@ def cmd_scan(cfg: Config, args: argparse.Namespace) -> int:
 
     from .regime import check_gates
 
-    gates = check_gates(result["regime"], cfg, now=datetime.now(ET))
+    from .events import build_calendar
+
+    gates = check_gates(result["regime"], cfg, now=datetime.now(ET),
+                        calendar=build_calendar(cfg))
     if not gates.passed:
         print("\nENTRY CONDITIONS NOT MET -- tickets below are shown for reference only:")
         for block in gates.blocks:
@@ -217,6 +220,7 @@ def cmd_explain(cfg: Config, args: argparse.Namespace) -> int:
 
 def cmd_regime(cfg: Config, args: argparse.Namespace) -> int:
     """Show what conditions look like right now, and whether they permit entry."""
+    from .events import build_calendar
     from .regime import check_gates, measure, resolve_vol_multiplier
     from .screener import load_chain, pick_expiration
 
@@ -237,7 +241,7 @@ def cmd_regime(cfg: Config, args: argparse.Namespace) -> int:
     multiplier, note = resolve_vol_multiplier(regime, cfg)
     print(f"\n  vol assumption       {note}")
 
-    gates = check_gates(regime, cfg, now=now)
+    gates = check_gates(regime, cfg, now=now, calendar=build_calendar(cfg))
     print(f"\n{'ENTRY PERMITTED' if gates.passed else 'ENTRY BLOCKED'}")
     for note in gates.notes:
         print(f"  + {note}")
@@ -251,6 +255,50 @@ def cmd_regime(cfg: Config, args: argparse.Namespace) -> int:
             "the rest of the time you are taking the tail risk for free."
         )
     return 0
+
+
+def cmd_calendar(cfg: Config, args: argparse.Namespace) -> int:
+    """List upcoming scheduled events and flag any stale source."""
+    from .events import IMPACT_RANK, build_calendar
+
+    calendar = build_calendar(cfg)
+    now = datetime.now(ET)
+    today = now.date()
+    status = calendar.status(today, today + timedelta(days=args.days), now=now)
+
+    print(f"sources: {', '.join(p.name for p in calendar.providers) or 'none'}")
+    if status.stale_sources:
+        print(f"STALE:   {', '.join(sorted(set(status.stale_sources)))}")
+        print("         A stale source reports no events, which looks exactly like a clear")
+        print("         day. Refresh it, or entries will be blocked while "
+              "require_event_calendar is on.")
+    if not status.available:
+        print("no calendar source produced anything.")
+        return 1
+
+    threshold = IMPACT_RANK.get(cfg.gates.block_impact_at_or_above, 2)
+    print(f"\nnext {args.days} days ({len(status.events)} events):")
+    for event in status.events:
+        blocking = IMPACT_RANK.get(event.impact, 0) >= threshold
+        marker = "BLOCK" if blocking else "     "
+        today_marker = " <- TODAY" if event.day == today else ""
+        print(f"  {marker}  {event.describe()}{today_marker}")
+
+    blocks, notes = _event_gate_now(calendar, cfg, now)
+    print()
+    for note in notes:
+        print(f"  + {note}")
+    for block in blocks:
+        print(f"  - {block}")
+    if not blocks:
+        print("  no event blocks in force right now.")
+    return 0
+
+
+def _event_gate_now(calendar, cfg, now):
+    from .events import check_event_gate
+
+    return check_event_gate(calendar, cfg, now=now)
 
 
 def cmd_watch(cfg: Config, args: argparse.Namespace) -> int:
@@ -296,6 +344,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = sub.add_parser("regime", help="measured conditions and whether they permit entry")
     g.set_defaults(func=cmd_regime)
+
+    cal = sub.add_parser("calendar", help="upcoming economic events and source freshness")
+    cal.add_argument("--days", type=int, default=30)
+    cal.set_defaults(func=cmd_calendar)
 
     w = sub.add_parser("watch", help="poll for entry conditions and monitor open positions")
     w.add_argument("--equity", type=float, help="size against this instead of the account")

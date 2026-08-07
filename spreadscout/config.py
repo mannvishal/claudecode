@@ -130,6 +130,22 @@ class GateConfig:
 
     blackout_dates: list[str] = field(default_factory=list)
 
+    # --- scheduled economic events ---------------------------------------
+    # FOMC at 14:00 ET is the one that matters. It lands mid-session, inside
+    # the entry window, while positions are open. The 08:30 releases have
+    # already printed by the time entries open, so they mostly signal that the
+    # session will realize more volatility than the trailing window implies.
+    block_on_events: bool = True
+    block_impact_at_or_above: str = "high"
+    event_minutes_before: int = 120
+    event_minutes_after: int = 90
+    # Fail closed: if no calendar source can confirm today is clear, block.
+    # Silence from a data source is not evidence of an empty calendar.
+    require_event_calendar: bool = True
+    use_derived_events: bool = True  # first-Friday NFP
+    event_calendar_file: str | None = None  # your own YAML, checked before the seed
+    event_cache_minutes: float = 360.0
+
 
 @dataclass
 class MonitorConfig:
@@ -258,3 +274,7 @@ class Config:
             raise SystemExit("alerts.poll_seconds must be >= 5 to stay inside rate limits")
         if self.alerts.webhook_min_severity not in ("INFO", "WARN", "CRITICAL"):
             raise SystemExit("alerts.webhook_min_severity must be INFO, WARN or CRITICAL")
+        if self.gates.block_impact_at_or_above not in ("low", "medium", "high"):
+            raise SystemExit("gates.block_impact_at_or_above must be low, medium or high")
+        if self.gates.event_minutes_before < 0 or self.gates.event_minutes_after < 0:
+            raise SystemExit("gates.event_minutes_before/after must be >= 0")

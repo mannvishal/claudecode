@@ -21,5 +21,8 @@ spreadscout = "spreadscout.cli:main"
 [tool.setuptools.packages.find]
 include = ["spreadscout*"]
 
+[tool.setuptools.package-data]
+spreadscout = ["data/*.yaml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

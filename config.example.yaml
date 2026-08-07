@@ -84,7 +84,46 @@ gates:
   entry_end_hour: 14            # After this there is too little time left to
   entry_end_minute: 0           # manage a position that turns against you.
 
-  blackout_dates: []            # e.g. ["2026-09-17"] for FOMC, CPI, NFP days
+  blackout_dates: []            # manual one-offs, on top of the event calendar below
+
+  # --- scheduled economic events -----------------------------------------
+  # FOMC at 14:00 ET is the one that matters. It lands mid-session, inside the
+  # entry window, while your position is open. The 08:30 releases (CPI, NFP)
+  # have already printed by the time entries open at 10:00 -- with the default
+  # -120/+90 window an 08:30 event blocks 06:30-10:00, which is clear before the
+  # entry window even starts. They matter mainly as a signal that the session
+  # will realize more volatility than the trailing window implies.
+  block_on_events: true
+  block_impact_at_or_above: high    # low | medium | high
+  event_minutes_before: 120
+  event_minutes_after: 90
+
+  # FAIL CLOSED. If no calendar source can confirm today is clear, block. A
+  # data source returning nothing is indistinguishable from a genuinely empty
+  # day, and guessing wrong here means holding a 0DTE condor through a rate
+  # decision. Set false only if you are checking the calendar yourself.
+  require_event_calendar: true
+
+  use_derived_events: true          # Employment Situation, first Friday 08:30 ET
+  event_calendar_file: null         # your own YAML, checked before the bundled seed
+  event_cache_minutes: 360.0
+
+  # Sources, in priority order:
+  #   derived       first-Friday NFP. A calendar rule, so it never goes stale.
+  #   user-file     event_calendar_file, if set. Put your CPI/PPI/PCE dates here.
+  #   bundled-seed  spreadscout/data/econ_events.yaml -- FOMC dates, which were
+  #                 written from memory and NOT fetched from a live source.
+  #                 VERIFY THEM against federalreserve.gov before relying on
+  #                 this. The file carries a verified_through date and reports
+  #                 itself stale past it, which blocks entry rather than
+  #                 pretending next year has no meetings.
+  #   fmp           FMP's economic calendar, if FMP_API_KEY is set. Requires
+  #                 their Starter tier or above, and the adapter is UNVERIFIED
+  #                 against the live endpoint. Supplementary: if it fails you
+  #                 get a warning, not a halt.
+  #
+  # Run `spreadscout calendar` to see what is loaded and whether anything
+  # is stale.
 
 monitor:
   # Thresholds for positions you ALREADY HOLD. These matter more than the entry

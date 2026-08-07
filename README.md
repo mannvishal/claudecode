@@ -15,6 +15,7 @@ webhook URL you supply.
 ```bash
 spreadscout watch     # monitor open positions + alert when conditions permit entry
 spreadscout regime    # what conditions look like right now, and why
+spreadscout calendar  # upcoming FOMC/NFP and whether any source has gone stale
 ```
 
 ---
@@ -58,7 +59,63 @@ All must pass. Each is a reason *not* to trade, and the default posture is no:
 | VIX percentile | ≥ 20th | Don't sell vol that is already on the floor |
 | Today's move | ≤ 1.25σ | Trend days are when short strikes get run over |
 | Time window | 10:00–14:00 ET | Early quotes are wide; late leaves no time to manage |
-| Blackout dates | — | Your own FOMC/CPI/NFP list |
+| Scheduled events | High impact | See below |
+| Blackout dates | — | Manual one-offs on top of the calendar |
+
+### The economic calendar
+
+**FOMC at 14:00 ET is the event that matters.** It lands mid-session, inside
+your entry window, while the position is open. The 08:30 releases (CPI, NFP)
+have already printed by the time entries open — with the default −120/+90
+window an 08:30 event blocks 06:30–10:00, clear before the entry window even
+starts. They matter mainly as a signal that the session will realize more
+volatility than the trailing window implies.
+
+```
+$ spreadscout calendar
+sources: derived, bundled-seed
+
+  BLOCK  2026-08-07 08:30 ET -- Employment Situation (NFP, derived) <- TODAY
+  BLOCK  2026-09-16 14:00 ET -- FOMC rate decision (with projections)
+
+  + Employment Situation at 08:30 ET today; entries blocked 06:30-10:00
+  no event blocks in force right now.
+```
+
+Three design rules, because the error costs here are wildly asymmetric — a
+false positive costs one skipped session, a false negative puts you in a 0DTE
+condor through a rate decision:
+
+- **Over-block when unsure.** An event with no known release time blocks the
+  whole day rather than being guessed at.
+- **Fail closed.** If no source can confirm today is clear, entry is blocked.
+  A data source returning nothing looks exactly like a genuinely empty day.
+- **Hardcoded dates announce their own expiry.** The bundled seed carries a
+  `verified_through` date and reports itself *stale* past it — which blocks —
+  rather than implying next year has no FOMC meetings.
+
+| Source | Coverage | Notes |
+|---|---|---|
+| `derived` | NFP, first Friday 08:30 | A calendar rule; never goes stale |
+| `user-file` | Whatever you add | Put your CPI/PPI/PCE dates here |
+| `bundled-seed` | FOMC 2026 | **Written from memory — verify it** (see below) |
+| `fmp` | Full macro calendar | Needs FMP Starter tier; adapter **unverified** |
+
+Staleness is split into *critical* (the files that carry FOMC dates — going
+stale blocks) and *supplementary* (an optional vendor feed — an outage warns).
+Fail-closed on a source you never depended on just teaches you to switch the
+gate off, and a gate that gets switched off protects nobody.
+
+> **Verify the seeded FOMC dates.** They were written from model memory at build
+> time, not fetched — `federalreserve.gov` was unreachable from the build
+> environment, and shipping an untested scraper would have been worse. Check
+> them against
+> <https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm> and correct
+> `spreadscout/data/econ_events.yaml` before you rely on it. CPI is deliberately
+> *not* seeded: it lands somewhere between roughly the 10th and 15th with no
+> rule tight enough to derive, and a wrong guess would block an arbitrary quiet
+> day while leaving the real one open — the exact failure this gate exists to
+> prevent.
 
 ### Position monitoring matters more
 
@@ -198,7 +255,7 @@ side cannot be assigned while the other is still open.
 pip install -e ".[dev]"
 cp .env.example .env          # add your Tradier token
 cp config.example.yaml spreadscout.yaml
-pytest                        # 196 tests
+pytest                        # 246 tests
 ```
 
 Get a token at <https://dash.tradier.com/settings/api>. Options chains with
@@ -217,6 +274,7 @@ are both gitignored.
 spreadscout watch                     # the main loop: monitor positions, alert on entries
 spreadscout watch --once              # a single pass, for testing your config
 spreadscout regime                    # measured conditions and whether they permit entry
+spreadscout calendar                  # upcoming economic events and source freshness
 spreadscout scan                      # screen today's expiry, print sized tickets
 spreadscout account                   # equity, open risk, daily stop status
 spreadscout explain                   # the expectancy arithmetic, worked through
@@ -259,6 +317,7 @@ is still worth knowing.
 | `regime.py` | Realized-vol measurement, variance risk premium, entry gates |
 | `monitor.py` | OCC parsing, position grouping, breach and loss alerts |
 | `alerts.py` | Routing, de-duplication, console/file/webhook sinks |
+| `events.py` | Economic calendar, providers, fail-closed event gate |
 | `watch.py` | The polling loop and its ordering guarantees |
 | `backtest.py` | Modelled historical replay |
 | `cli.py` | Commands |
