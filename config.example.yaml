@@ -1,0 +1,58 @@
+# Copy to spreadscout.yaml and edit. Every value here has a default in config.py;
+# this file exists to make the assumptions visible rather than buried.
+
+symbol: SPX
+dte: 0                  # 0 = today's expiry (SPXW, PM-settled)
+environment: production # this tool never places orders in either environment
+risk_free_rate: 0.04
+dividend_yield: 0.013   # SPX index dividend yield; feeds the forward, not the payoff
+# account_id: 6YA00000  # omit to use the first account on the profile
+
+filters:
+  min_open_interest: 100
+  min_volume: 10
+  max_relative_spread: 0.20   # reject legs quoted wider than 20% of mid
+  min_short_delta: 0.05
+  max_short_delta: 0.25
+  # Credit must be at least this fraction of the width. The classic "collect a
+  # third of the width" guidance is a 30-45 DTE rule and does not survive
+  # contact with a 0DTE chain -- measured live, SPX 0DTE spreads in this delta
+  # band price between 0.10 and 0.18 of width. Raising this toward 0.33 does not
+  # find you better trades, it just leaves you with the few strikes closest to
+  # the money, which are the highest-gamma ones on the board.
+  min_credit_ratio: 0.10
+  min_credit: 0.30            # index points
+  widths: [5.0, 10.0, 25.0]
+  max_candidates: 15
+
+costs:
+  commission_per_contract: 0.35   # Tradier options commission
+  exchange_fee_per_contract: 0.49 # SPX index option exchange/regulatory fees
+  assume_closing_trade: true      # doubles per-leg costs; set false if you always
+                                  # let 0DTE cash-settle instead of closing early
+  fill_fraction: 0.40             # 0 = mid fill (fantasy), 1 = pay the full spread
+
+risk:
+  max_risk_pct_per_trade: 0.02
+  max_total_risk_pct: 0.06
+  max_contracts: 10
+  daily_loss_limit_pct: 0.03
+  min_equity: 2000.0
+  require_positive_ev: true       # refuse to size a trade that loses money on average
+
+beliefs:
+  # THE ONLY SOURCE OF EDGE IN THIS STRATEGY.
+  #
+  # 1.00 means you think implied vol is a fair forecast of realized vol. At 1.00
+  # every candidate will show negative expected value after costs, and with
+  # require_positive_ev: true the tool will recommend nothing. That is correct
+  # behaviour, not a bug.
+  #
+  # Below 1.00 means you expect realized to come in under implied -- the variance
+  # risk premium. Historically that has averaged somewhere around 0.85 on SPX,
+  # but the average is taken over the crash days, not instead of them, and the
+  # premium is thinnest exactly when you most want it. Pick this number
+  # deliberately and write down why.
+  vol_multiplier: 1.00
+  # drift: null           # continuously-compounded expected index return;
+                          # defaults to risk_free_rate - dividend_yield
