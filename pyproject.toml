@@ -10,16 +10,22 @@ requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
     "PyYAML>=6.0",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# `databento` is deliberately an extra, not a hard dependency: signals, fills,
+# reporting and every test run without it. Install it only to pull live data.
+databento = ["databento>=0.34"]
 
 [project.scripts]
 spreadscout = "spreadscout.cli:main"
+spreadscout-backtest = "backtest.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["spreadscout*"]
+include = ["spreadscout*", "backtest*"]
 
 [tool.setuptools.package-data]
 spreadscout = ["data/*.yaml"]
