@@ -1,6 +1,6 @@
 """Synthetic Databento frames, for exercising the pipeline without spending money.
 
-These match the OPRA ``definition`` and ``mbp-1`` column layouts, so the engine
+These match the OPRA ``definition`` and ``cmbp-1`` column layouts, so the engine
 runs the same code path it will run against live data. They are a test harness,
 not a data source: the price path is a generated GBM walk and the quotes are
 Black-Scholes values with a fixed spread. Nothing measured against a fixture
@@ -120,18 +120,21 @@ def seed_cache(cache, cfg, day: date, **kwargs) -> tuple[pd.DataFrame, pd.DataFr
     rather than bypassing it.
     """
     from .cache import CacheKey
-    from .config import SCHEMA_DEFINITION, SCHEMA_MBP1
+    from .config import SCHEMA_DEFINITION, SCHEMA_QUOTES
 
     definitions, quotes, _path = build_session(day, **kwargs)
 
+    # Keyed on the parent symbol, matching the request the engine issues. A
+    # fixture seeded under a different key than the engine looks up is a cache
+    # miss that only shows up at run time.
     cache.write(
-        CacheKey.build(cfg.data.dataset, SCHEMA_DEFINITION, day, None),
+        CacheKey.build(cfg.data.dataset, SCHEMA_DEFINITION, day, [cfg.data.parent_symbol]),
         definitions,
         meta={"synthetic": True},
     )
     symbols = sorted(quotes["symbol"].unique())
     cache.write(
-        CacheKey.build(cfg.data.dataset, SCHEMA_MBP1, day, symbols),
+        CacheKey.build(cfg.data.dataset, SCHEMA_QUOTES, day, symbols),
         quotes,
         meta={"synthetic": True},
     )

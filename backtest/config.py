@@ -16,7 +16,11 @@ import yaml
 # weekly root that carries every 0DTE contract.
 OPRA_DATASET = "OPRA.PILLAR"
 SCHEMA_DEFINITION = "definition"
-SCHEMA_MBP1 = "mbp-1"
+# Top-of-book quotes. OPRA does not carry `mbp-1`: because it is a consolidated
+# feed rather than a single venue, the equivalent schema is `cmbp-1`, whose
+# book columns (bid_px_00/ask_px_00/bid_sz_00/ask_sz_00) are the ones the quote
+# parser reads. Named for its role so a schema change does not rename the world.
+SCHEMA_QUOTES = "cmbp-1"
 
 
 @dataclass
@@ -85,7 +89,11 @@ class DataConfig:
     cache_dir: Path = Path("./data")
     dataset: str = OPRA_DATASET
     underlying_root: str = "SPXW"
-    parent_symbol: str = "SPX.OPT"
+    # Must agree with ``underlying_root``: OPRA treats SPX and SPXW as separate
+    # parents, so `SPX.OPT` returns the AM-settled monthlies and none of the
+    # weeklies that carry 0DTE. Pulling the wrong one yields an empty chain
+    # after the root filter rather than an error.
+    parent_symbol: str = "SPXW.OPT"
     # Quote window pulled per session. Starting before the entry time gives the
     # strike selector something to look at; ending at the close covers exits.
     quote_start: time = time(9, 45)
@@ -127,6 +135,15 @@ class BacktestConfig:
             raise SystemExit("signal.entry_time must precede signal.exit_time")
         if not 0 < self.signal.strike_band_pct < 0.5:
             raise SystemExit("signal.strike_band_pct must be in (0, 0.5)")
+        # A parent that disagrees with the root fails silently: the definition
+        # pull succeeds, the root filter discards every row, and the session is
+        # skipped as "no contracts" having already been paid for.
+        if self.data.parent_symbol.split(".")[0] != self.data.underlying_root:
+            raise SystemExit(
+                f"data.parent_symbol {self.data.parent_symbol!r} does not match "
+                f"data.underlying_root {self.data.underlying_root!r}; the chain "
+                f"would come back empty after the root filter."
+            )
 
     @classmethod
     def load(cls, path: str | Path | None = None, **overrides) -> "BacktestConfig":

@@ -36,7 +36,7 @@ from typing import Protocol
 import pandas as pd
 
 from .cache import CacheKey, ParquetCache
-from .config import BacktestConfig
+from .config import SCHEMA_DEFINITION, BacktestConfig
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +112,19 @@ def session_bounds(day: date, start: time, end: time) -> tuple[pd.Timestamp, pd.
     return lo, hi
 
 
+def definition_bounds(day: date) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Full UTC day, which is the only window that returns a complete chain.
+
+    Definitions are not a stream of intraday events but a snapshot stamped at
+    the start of the UTC day. Requesting them over the trading session instead
+    -- 13:45 UTC onward -- silently returns whatever definitions happened to be
+    restated later in the day, so contracts listed at the open go missing and
+    the chain comes back short. The SDK warns about this; the warning is right.
+    """
+    lo = pd.Timestamp(day, tz="UTC")
+    return lo, lo + pd.Timedelta(days=1)
+
+
 class Fetcher(Protocol):
     def fetch(
         self, schema: str, day: date, symbols: list[str] | None,
@@ -157,7 +170,10 @@ class DatabentoFetcher:
         actually fetched would make the whole gate decorative. It is also what
         the SDK-conformance test binds against.
         """
-        lo, hi = session_bounds(day, start, end)
+        if schema == SCHEMA_DEFINITION:
+            lo, hi = definition_bounds(day)
+        else:
+            lo, hi = session_bounds(day, start, end)
         return {
             "dataset": self.cfg.data.dataset,
             "schema": schema,

@@ -6,13 +6,15 @@ lookup, no silent re-pull of cached data, and no fill that could not have
 happened.
 """
 
+import datetime as dt
+import os
 from datetime import date, datetime, time
 
 import pandas as pd
 import pytest
 
 from backtest.cache import CacheKey, ParquetCache, symbol_fingerprint
-from backtest.config import SCHEMA_MBP1, BacktestConfig
+from backtest.config import SCHEMA_DEFINITION, SCHEMA_QUOTES, BacktestConfig
 from backtest.data import (
     CALL,
     PUT,
@@ -76,6 +78,30 @@ class TestExplicitDates:
         cfg.validate()
 
 
+class TestParentSymbolMatchesRoot:
+    """OPRA lists SPX and SPXW as separate parents.
+
+    A mismatch is the worst kind of misconfiguration: the definition pull is
+    billed and succeeds, the root filter then discards every row, and the
+    session is reported as "no contracts" -- which reads like a market-data gap
+    rather than a config error.
+    """
+
+    def test_mismatched_parent_is_rejected(self, cfg):
+        cfg.data.parent_symbol = "SPX.OPT"
+        cfg.data.underlying_root = "SPXW"
+        with pytest.raises(SystemExit, match="does not match"):
+            cfg.validate()
+
+    def test_matching_parent_passes(self, cfg):
+        cfg.data.parent_symbol = "SPXW.OPT"
+        cfg.data.underlying_root = "SPXW"
+        cfg.validate()
+
+    def test_the_default_pair_agrees(self, cfg):
+        assert cfg.data.parent_symbol.split(".")[0] == cfg.data.underlying_root
+
+
 # --------------------------------------------------------------------------
 # Rule 4: timezone normalisation
 # --------------------------------------------------------------------------
@@ -119,7 +145,7 @@ class TestTimezone:
 class TestCache:
     def test_roundtrip(self, tmp_path):
         cache = ParquetCache(tmp_path)
-        key = CacheKey.build("OPRA.PILLAR", SCHEMA_MBP1, DAY, ["A", "B"])
+        key = CacheKey.build("OPRA.PILLAR", SCHEMA_QUOTES, DAY, ["A", "B"])
         frame = pd.DataFrame({"symbol": ["A"], "bid_px_00": [1.0]})
         cache.write(key, frame)
         assert cache.has(key)
@@ -226,7 +252,7 @@ class TestCostGate:
     def test_estimate_is_printed_even_when_cheap(self, cfg):
         printed = []
         f = self._fetcher(cfg, FakeDatabento(cost=0.01), echo=printed.append)
-        f.fetch(SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0))
+        f.fetch(SCHEMA_QUOTES, DAY, ["A"], time(9, 45), time(16, 0))
         assert any("cost estimate $0.0100" in p for p in printed)
 
     def test_over_ceiling_halts_before_fetching(self, cfg):
@@ -234,54 +260,54 @@ class TestCostGate:
         client = FakeDatabento(cost=50.0)
         f = self._fetcher(cfg, client)
         with pytest.raises(CostCeilingExceeded, match="above the"):
-            f.fetch(SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0))
+            f.fetch(SCHEMA_QUOTES, DAY, ["A"], time(9, 45), time(16, 0))
         assert client.timeseries.calls == 0  # nothing was pulled
 
     def test_under_ceiling_proceeds(self, cfg):
         cfg.cost.ceiling_usd = 100.0
         client = FakeDatabento(cost=1.0)
         f = self._fetcher(cfg, client)
-        f.fetch(SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0))
+        f.fetch(SCHEMA_QUOTES, DAY, ["A"], time(9, 45), time(16, 0))
         assert client.timeseries.calls == 1
 
     def test_unavailable_estimate_halts_by_default(self, cfg):
         client = FakeDatabento(fail_cost=True)
         f = self._fetcher(cfg, client)
         with pytest.raises(CostEstimateUnavailable):
-            f.fetch(SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0))
+            f.fetch(SCHEMA_QUOTES, DAY, ["A"], time(9, 45), time(16, 0))
         assert client.timeseries.calls == 0
 
     def test_unavailable_estimate_can_be_allowed_explicitly(self, cfg):
         cfg.cost.require_estimate = False
         client = FakeDatabento(fail_cost=True)
         f = self._fetcher(cfg, client)
-        f.fetch(SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0))
+        f.fetch(SCHEMA_QUOTES, DAY, ["A"], time(9, 45), time(16, 0))
         assert client.timeseries.calls == 1
 
     def test_cached_range_is_never_refetched(self, cfg):
         client = FakeDatabento(cost=1.0)
         f = self._fetcher(cfg, client)
-        f.fetch(SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0))
-        f.fetch(SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0))
+        f.fetch(SCHEMA_QUOTES, DAY, ["A"], time(9, 45), time(16, 0))
+        f.fetch(SCHEMA_QUOTES, DAY, ["A"], time(9, 45), time(16, 0))
         assert client.timeseries.calls == 1
 
     def test_a_cache_hit_does_not_even_price_the_pull(self, cfg):
         client = FakeDatabento(cost=1.0)
         f = self._fetcher(cfg, client)
-        f.fetch(SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0))
+        f.fetch(SCHEMA_QUOTES, DAY, ["A"], time(9, 45), time(16, 0))
         before = client.metadata.calls
-        f.fetch(SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0))
+        f.fetch(SCHEMA_QUOTES, DAY, ["A"], time(9, 45), time(16, 0))
         assert client.metadata.calls == before
 
     def test_fetched_data_lands_in_eastern(self, cfg):
         f = self._fetcher(cfg, FakeDatabento())
-        frame, _ = f.fetch(SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0))
+        frame, _ = f.fetch(SCHEMA_QUOTES, DAY, ["A"], time(9, 45), time(16, 0))
         assert frame["ts_recv"].iloc[0].hour == 10
 
     def test_offline_fetcher_never_pulls(self, cfg):
         f = AgentBridgeFetcher(cfg, ParquetCache(cfg.data.cache_dir), echo=lambda *_: None)
         with pytest.raises(KeyError, match="offline mode"):
-            f.fetch(SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0))
+            f.fetch(SCHEMA_QUOTES, DAY, ["A"], time(9, 45), time(16, 0))
 
 
 # --------------------------------------------------------------------------
@@ -664,7 +690,7 @@ class TestSdkConformance:
 
     def _kwargs(self, cfg):
         return self._fetcher(cfg).request_kwargs(
-            SCHEMA_MBP1, DAY, ["SPXW260806P05000000"], time(9, 45), time(16, 0), "raw_symbol"
+            SCHEMA_QUOTES, DAY, ["SPXW260806P05000000"], time(9, 45), time(16, 0), "raw_symbol"
         )
 
     def test_get_cost_accepts_our_arguments(self, cfg):
@@ -710,5 +736,49 @@ class TestSdkConformance:
     def test_cost_and_range_describe_the_same_request(self, cfg):
         """A cost quoted for a different window than the pull is a decorative gate."""
         f = self._fetcher(cfg)
-        args = (SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0), "raw_symbol")
+        args = (SCHEMA_QUOTES, DAY, ["A"], time(9, 45), time(16, 0), "raw_symbol")
         assert f.request_kwargs(*args) == f.request_kwargs(*args)
+
+    def test_the_definition_window_is_the_whole_utc_day(self, cfg):
+        """Definitions are a start-of-UTC-day snapshot, not an intraday stream.
+
+        Requesting them over the session window returns a short chain rather
+        than an error, so nothing downstream can notice.
+        """
+        kwargs = self._fetcher(cfg).request_kwargs(
+            SCHEMA_DEFINITION, DAY, ["SPXW.OPT"], time(9, 45), time(16, 0), "parent"
+        )
+        assert (kwargs["start"].hour, kwargs["start"].minute) == (0, 0)
+        assert kwargs["end"] - kwargs["start"] == dt.timedelta(days=1)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DATABENTO_API_KEY"),
+    reason="needs a live API key; metadata calls are free but still networked",
+)
+class TestVendorAgreesWithOurConstants:
+    """The half of conformance that only the server can answer.
+
+    Argument binding cannot catch a schema or symbol that is well-formed but
+    does not exist on this dataset -- `mbp-1` is a valid Databento schema and a
+    valid Python string, and OPRA rejects it with a 422 at request time. These
+    are free metadata calls, and they are the difference between finding that
+    out here and finding it out mid-pull.
+    """
+
+    def _client(self):
+        return databento.Historical()
+
+    def test_the_quote_schema_exists_on_the_dataset(self, cfg):
+        available = self._client().metadata.list_schemas(dataset=cfg.data.dataset)
+        assert SCHEMA_QUOTES in available, (
+            f"{SCHEMA_QUOTES!r} is not offered on {cfg.data.dataset}; "
+            f"available: {sorted(available)}"
+        )
+
+    def test_the_definition_schema_exists_on_the_dataset(self, cfg):
+        available = self._client().metadata.list_schemas(dataset=cfg.data.dataset)
+        assert SCHEMA_DEFINITION in available
+
+    def test_the_dataset_exists(self, cfg):
+        assert cfg.data.dataset in self._client().metadata.list_datasets()

@@ -12,7 +12,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from .config import SCHEMA_DEFINITION, SCHEMA_MBP1, BacktestConfig
+from .config import SCHEMA_DEFINITION, SCHEMA_QUOTES, BacktestConfig
 from .data import (
     CALL,
     PUT,
@@ -92,8 +92,11 @@ class Engine:
     # --- data assembly ---------------------------------------------------
 
     def _chain(self, day: date) -> list[Contract]:
+        # Ask for one parent, not ALL_SYMBOLS. The whole-OPRA definition file
+        # prices at ~$3.46 a session against ~$0.04 for SPXW alone, and every
+        # row outside this root is discarded by the filter below anyway.
         frame, _ = self.fetcher.fetch(
-            SCHEMA_DEFINITION, day, None,
+            SCHEMA_DEFINITION, day, [self.cfg.data.parent_symbol],
             self.cfg.data.quote_start, self.cfg.data.quote_end, stype_in="parent",
         )
         return contracts_from_definitions(frame, self.cfg.data.underlying_root, day)
@@ -116,7 +119,7 @@ class Engine:
 
     def _quotes(self, day: date, symbols: list[str]) -> QuoteBook:
         frame, _ = self.fetcher.fetch(
-            SCHEMA_MBP1, day, symbols,
+            SCHEMA_QUOTES, day, symbols,
             self.cfg.data.quote_start, self.cfg.data.quote_end, stype_in="raw_symbol",
         )
         return QuoteBook(frame)

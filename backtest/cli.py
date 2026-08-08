@@ -14,7 +14,7 @@ import sys
 from datetime import date
 
 from .cache import ParquetCache
-from .config import SCHEMA_DEFINITION, SCHEMA_MBP1, BacktestConfig
+from .config import SCHEMA_DEFINITION, SCHEMA_QUOTES, BacktestConfig
 from .engine import Engine
 from .fills import MidFill, MidMinusEdgeFill
 from .report import render_report
@@ -139,27 +139,50 @@ def cmd_cost(args) -> int:
     cache = ParquetCache(cfg.data.cache_dir)
     fetcher = DatabentoFetcher(cfg, cache)
 
-    total, priced, day = 0.0, 0, cfg.start_date
+    total, priced, unpriced, day = 0.0, 0, 0, cfg.start_date
     from datetime import timedelta
 
-    print(f"pricing {cfg.start_date} .. {cfg.end_date} (no data will be pulled)\n")
+    # Price the two requests the engine actually issues, per session: the
+    # definition file for one parent, and the quote pull. The quote figure is
+    # for the whole SPXW chain, which is an *upper bound* -- the engine narrows
+    # each real pull to a strike band it cannot know the size of until the
+    # definitions are in hand. Pricing ALL_SYMBOLS instead, as this command
+    # once did, quotes a request nothing in the harness ever makes, and on
+    # cmbp-1 the estimate endpoint times out trying to compute it.
+    parent = [cfg.data.parent_symbol]
+    print(f"pricing {cfg.start_date} .. {cfg.end_date} (no data will be pulled)")
+    print(f"parent {cfg.data.parent_symbol}, quotes {SCHEMA_QUOTES}\n")
+    print(f"  {'session':12s}  {'definitions':>12s}  {'quotes (max)':>14s}")
     while day <= cfg.end_date:
         if day.weekday() < 5:
-            estimate = fetcher.estimate_cost(
-                SCHEMA_MBP1, day, None, cfg.data.quote_start, cfg.data.quote_end, "parent"
+            defs = fetcher.estimate_cost(
+                SCHEMA_DEFINITION, day, parent,
+                cfg.data.quote_start, cfg.data.quote_end, "parent",
             )
-            if estimate is None:
-                print(f"  {day}  estimate unavailable")
+            quotes = fetcher.estimate_cost(
+                SCHEMA_QUOTES, day, parent,
+                cfg.data.quote_start, cfg.data.quote_end, "parent",
+            )
+            if defs is None or quotes is None:
+                unpriced += 1
+                print(f"  {str(day):12s}  {'unavailable':>12s}  {'unavailable':>14s}")
             else:
-                total += estimate
+                total += defs + quotes
                 priced += 1
-                print(f"  {day}  ${estimate:,.4f}")
+                print(f"  {str(day):12s}  {'$' + format(defs, ',.4f'):>12s}"
+                      f"  {'$' + format(quotes, ',.4f'):>14s}")
         day += timedelta(days=1)
 
-    print(f"\n  {priced} sessions priced, ${total:,.2f} total")
+    print(f"\n  {priced} sessions priced, ${total:,.2f} total upper bound")
+    if unpriced:
+        # Rule 1 again: an unpriced session is not a free one, and a total that
+        # silently omits it reads as cheaper than the range actually is.
+        print(f"  {unpriced} session(s) could NOT be priced and are excluded from that total")
     print(f"  per-pull ceiling is ${cfg.cost.ceiling_usd:,.2f}")
-    print("\n  Note: this prices the *unfiltered* chain. The engine restricts each")
-    print("  pull to a strike band around the money, which is materially cheaper.")
+    if priced:
+        print(f"\n  Quote figures cover the full {cfg.data.underlying_root} chain. The engine")
+        print(f"  restricts each pull to a ±{cfg.signal.strike_band_pct:.0%} strike band, which is")
+        print("  materially cheaper; these are ceilings, not forecasts.")
     return 0
 
 
