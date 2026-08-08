@@ -183,13 +183,25 @@ class FakeTimeseries:
 
     def get_range(self, **kwargs):
         self.calls += 1
+        self.last_kwargs = kwargs
 
         class Result:
+            """Stands in for a DBNStore.
+
+            ``to_df`` mirrors the real one: it requires the options we pin
+            explicitly, and it returns a frame indexed on ts_recv so the
+            adapter's ``reset_index()`` is actually exercised rather than
+            being incidentally harmless.
+            """
+
             def __init__(self, f):
                 self._f = f
 
-            def to_df(self):
-                return self._f
+            def to_df(self, price_type=None, map_symbols=None, tz=None):
+                assert price_type == "float", "adapter must pin float prices"
+                assert map_symbols is True, "adapter must request the symbol column"
+                assert tz == "UTC", "to_eastern converts from UTC"
+                return self._f.set_index("ts_recv")
 
         return Result(self.frame)
 
@@ -628,3 +640,75 @@ class TestEndToEnd:
         stats = compute_stats([])
         assert stats.trades == 0
         assert trade_log([]).empty
+
+
+# --------------------------------------------------------------------------
+# SDK conformance
+# --------------------------------------------------------------------------
+
+databento = pytest.importorskip("databento", reason="databento SDK not installed")
+
+
+class TestSdkConformance:
+    """Bind our arguments against the real SDK signatures.
+
+    This is the cheap half of verifying an adapter written without live access:
+    it cannot tell us the data comes back correct, but it does catch the failure
+    mode where an SDK upgrade renames or drops a parameter and the first sign is
+    a traceback partway through a paid multi-day pull.
+    """
+
+    def _fetcher(self, cfg):
+        return DatabentoFetcher(cfg, ParquetCache(cfg.data.cache_dir),
+                                client=object(), echo=lambda *_: None)
+
+    def _kwargs(self, cfg):
+        return self._fetcher(cfg).request_kwargs(
+            SCHEMA_MBP1, DAY, ["SPXW260806P05000000"], time(9, 45), time(16, 0), "raw_symbol"
+        )
+
+    def test_get_cost_accepts_our_arguments(self, cfg):
+        import inspect
+
+        from databento.historical.api.metadata import MetadataHttpAPI
+
+        sig = inspect.signature(MetadataHttpAPI.get_cost)
+        # `self` is unbound here, so supply a placeholder.
+        sig.bind(None, **self._kwargs(cfg))
+
+    def test_get_range_accepts_our_arguments(self, cfg):
+        import inspect
+
+        from databento.historical.api.timeseries import TimeseriesHttpAPI
+
+        sig = inspect.signature(TimeseriesHttpAPI.get_range)
+        sig.bind(None, **self._kwargs(cfg))
+
+    def test_to_df_accepts_the_options_we_pin(self):
+        import inspect
+
+        from databento.common.dbnstore import DBNStore
+
+        params = set(inspect.signature(DBNStore.to_df).parameters)
+        assert {"price_type", "map_symbols", "tz"} <= params
+
+    def test_to_df_still_defaults_to_utc(self):
+        """`to_eastern` converts from UTC; if this default moved, it would be wrong."""
+        import datetime as dt
+        import inspect
+
+        from databento.common.dbnstore import DBNStore
+
+        default = inspect.signature(DBNStore.to_df).parameters["tz"].default
+        assert getattr(default, "value", default) == dt.timezone.utc
+
+    def test_the_request_window_is_utc(self, cfg):
+        kwargs = self._kwargs(cfg)
+        # 09:45 ET in August is 13:45 UTC.
+        assert kwargs["start"].hour == 13 and kwargs["start"].minute == 45
+
+    def test_cost_and_range_describe_the_same_request(self, cfg):
+        """A cost quoted for a different window than the pull is a decorative gate."""
+        f = self._fetcher(cfg)
+        args = (SCHEMA_MBP1, DAY, ["A"], time(9, 45), time(16, 0), "raw_symbol")
+        assert f.request_kwargs(*args) == f.request_kwargs(*args)

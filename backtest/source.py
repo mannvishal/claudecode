@@ -14,6 +14,16 @@ On why the MCP server is not the fetcher: an MCP tool can only be invoked by an
 agent inside a live session. A harness you run yourself cannot call one. The
 ``AgentBridgeFetcher`` exists for the case where an agent has pre-populated the
 cache; it never fetches, and a miss is a hard error rather than a silent pull.
+
+Conformance: every keyword this module sends is checked against the installed
+SDK's real signatures by ``TestSdkConformance`` in ``tests/test_backtest.py``,
+which skips when ``databento`` is absent. Verified against SDK 0.83.0 --
+``metadata.get_cost`` and ``timeseries.get_range`` both accept the argument set
+built by ``request_kwargs``, ``to_df()`` indexes on ``ts_recv`` (hence the
+``reset_index``), and its timestamps arrive in UTC, which is what ``to_eastern``
+converts from. What remains unverified is live behaviour: no request has been
+made against the real endpoint from this environment, because outbound access to
+``hist.databento.com`` is blocked by the egress policy here.
 """
 
 from __future__ import annotations
@@ -136,19 +146,34 @@ class DatabentoFetcher:
             self._client = db.Historical()
         return self._client
 
+    def request_kwargs(
+        self, schema: str, day: date, symbols: list[str] | None,
+        start: time, end: time, stype_in: str,
+    ) -> dict:
+        """The arguments shared by ``get_cost`` and ``get_range``.
+
+        Built in one place so the estimate and the pull can never describe
+        different requests -- a cost quoted for a narrower window than the one
+        actually fetched would make the whole gate decorative. It is also what
+        the SDK-conformance test binds against.
+        """
+        lo, hi = session_bounds(day, start, end)
+        return {
+            "dataset": self.cfg.data.dataset,
+            "schema": schema,
+            "symbols": symbols or "ALL_SYMBOLS",
+            "stype_in": stype_in,
+            "start": lo.tz_convert(UTC).to_pydatetime(),
+            "end": hi.tz_convert(UTC).to_pydatetime(),
+        }
+
     def estimate_cost(
         self, schema: str, day: date, symbols: list[str] | None,
         start: time, end: time, stype_in: str,
     ) -> float | None:
-        lo, hi = session_bounds(day, start, end)
         try:
             return float(self.client.metadata.get_cost(
-                dataset=self.cfg.data.dataset,
-                schema=schema,
-                symbols=symbols or "ALL_SYMBOLS",
-                stype_in=stype_in,
-                start=lo.tz_convert(UTC).to_pydatetime(),
-                end=hi.tz_convert(UTC).to_pydatetime(),
+                **self.request_kwargs(schema, day, symbols, start, end, stype_in)
             ))
         except Exception as exc:
             log.warning("cost estimate failed for %s %s: %s", schema, day, exc)
@@ -185,16 +210,19 @@ class DatabentoFetcher:
             if estimate > self.cfg.cost.ceiling_usd:
                 raise CostCeilingExceeded(estimate, self.cfg.cost.ceiling_usd, describe)
 
-        lo, hi = session_bounds(day, start, end)
         data = self.client.timeseries.get_range(
-            dataset=self.cfg.data.dataset,
-            schema=schema,
-            symbols=symbols or "ALL_SYMBOLS",
-            stype_in=stype_in,
-            start=lo.tz_convert(UTC).to_pydatetime(),
-            end=hi.tz_convert(UTC).to_pydatetime(),
+            **self.request_kwargs(schema, day, symbols, start, end, stype_in)
         )
-        frame = to_eastern(data.to_df().reset_index())
+        # These three are SDK defaults today, passed explicitly so a future
+        # default change cannot silently alter prices, drop the symbol column,
+        # or hand us timestamps in a zone `to_eastern` is not expecting.
+        #   price_type=float  -> prices as floats, not 1e-9 fixed point
+        #   map_symbols       -> adds the `symbol` column QuoteBook keys on
+        #   tz=UTC            -> the input `to_eastern` converts from
+        # to_df() indexes on ts_recv, so reset_index() is required to make it a
+        # column rather than losing it into the index.
+        frame = data.to_df(price_type="float", map_symbols=True, tz=UTC).reset_index()
+        frame = to_eastern(frame)
 
         pull = Pull(self.cfg.data.dataset, schema, day, symbols, len(frame), estimate, False)
         self.cache.write(key, frame, meta={"cost_usd": estimate, "stype_in": stype_in})

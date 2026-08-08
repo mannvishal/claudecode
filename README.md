@@ -305,6 +305,51 @@ no model here can halt trading or blow through a strike between prints. Treat
 the output as an **upper bound**. An upper bound that already looks unattractive
 is still worth knowing.
 
+## Running the backtest against live Databento
+
+`backtest/` needs the Databento **Python SDK**, not an MCP server — MCP tools can
+only be called by an agent inside a live session, so nothing you run unattended
+can use one. There is also no Databento connector in the MCP registry; I checked.
+
+```bash
+pip install -e ".[databento]"
+export DATABENTO_API_KEY=db-...
+spreadscout-backtest cost  --start 2026-07-01 --end 2026-07-31   # price it first
+spreadscout-backtest smoke --date 2026-07-15                     # one session
+spreadscout-backtest run   --start 2026-07-01 --end 2026-07-31 --out trades.csv
+```
+
+**This will not work from a Claude Code web/remote session** unless the
+environment's network policy allows `hist.databento.com`. Outbound access there
+is governed by the sandbox egress proxy, which currently refuses the CONNECT:
+
+```
+{"kind": "connect_rejected", "host": "hist.databento.com:443",
+ "detail": "gateway answered 403 to CONNECT (policy denial...)"}
+```
+
+`api.tradier.com` is blocked the same way, which is why the live tool's Tradier
+access runs through an MCP server rather than direct HTTP — MCP servers execute
+outside the sandbox. To run the backtest in a remote session you would need to
+allow that host in the environment's network policy
+([docs](https://code.claude.com/docs/en/claude-code-on-the-web)). On your own
+machine none of this applies and it works today.
+
+### How far the adapter is verified
+
+| Checked | How |
+|---|---|
+| `metadata.get_cost` argument set | Bound against the real signature, SDK 0.83.0 |
+| `timeseries.get_range` argument set | Same |
+| `to_df()` indexes on `ts_recv` | Confirmed — hence `reset_index()` |
+| `to_df()` returns UTC | Confirmed — what `to_eastern` converts from |
+| Float prices, `symbol` column | Pinned explicitly rather than left to defaults |
+| **Live response behaviour** | **Not verified** — no request has ever left this environment |
+
+`TestSdkConformance` runs these checks whenever the SDK is installed and skips
+when it isn't, so an SDK upgrade that renames a parameter fails in CI rather than
+partway through a paid multi-day pull.
+
 ## Layout
 
 | File | Role |
