@@ -320,7 +320,9 @@ spreadscout-backtest run   --start 2026-07-01 --end 2026-07-31 --out trades.csv
 ```
 
 **This will not work from a Claude Code web/remote session** unless the
-environment's network policy allows `hist.databento.com`. Outbound access there
+environment's network policy allows `hist.databento.com` — see
+[docs/databento-setup.md](docs/databento-setup.md) for the exact steps and the
+order to verify things in. Outbound access there
 is governed by the sandbox egress proxy, which currently refuses the CONNECT:
 
 ```
