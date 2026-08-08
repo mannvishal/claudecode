@@ -226,7 +226,7 @@ def cmd_regime(cfg: Config, args: argparse.Namespace) -> int:
 
     client = _client(cfg)
     now = datetime.now(ET)
-    expiration = pick_expiration(client, cfg.symbol, cfg.dte)
+    expiration = pick_expiration(client, cfg.symbol, cfg.dte, now=now)
     spot, _T, contracts = load_chain(client, cfg, expiration, now=now)
     regime = measure(client, cfg, spot, contracts, now=now)
 

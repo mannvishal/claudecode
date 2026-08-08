@@ -346,3 +346,41 @@ class TestCriticalPositionBlocksEntry:
         client = FakeClient(realized_vol=CALM_RV, positions=near)
         run_once(client, cfg, router, state, "TEST123", None, now=NOW)
         assert "entry" in kinds(rec), titles(rec)
+
+
+class TestClockInjection:
+    """A pass must use one clock throughout.
+
+    `pick_expiration` originally read the wall clock while everything else in
+    the pass took the injected `now`. The two agree in normal operation, so the
+    bug stayed invisible until the real date rolled past the pinned test date
+    and 17 tests went red at once. It would also have surfaced in production on
+    any session running across midnight ET, where the expiry selected and the
+    gates evaluated would describe different days.
+
+    These pin `now` to a date deliberately unrelated to today so the coupling
+    cannot silently return.
+    """
+
+    def test_a_pass_uses_the_injected_clock_not_the_wall_clock(self, cfg, router, rec, state):
+        client = FakeClient(realized_vol=CALM_RV)
+        state.day = NOW.date()
+        run_once(client, cfg, router, state, "TEST123", None, now=NOW)
+        assert "entry" in kinds(rec), titles(rec)
+
+    def test_expiry_selection_honours_the_injected_clock(self):
+        from spreadscout.screener import pick_expiration
+
+        client = FakeClient()
+        # FakeClient lists only EXPIRY (2026-08-07). Asking as of that morning
+        # must find it, regardless of what today actually is.
+        morning = datetime(2026, 8, 7, 9, 0, tzinfo=ET)
+        assert pick_expiration(client, "SPX", 0, now=morning) == EXPIRY
+
+    def test_expiry_selection_rejects_a_past_expiry(self):
+        from spreadscout.screener import pick_expiration
+
+        client = FakeClient()
+        later = datetime(2026, 8, 8, 9, 0, tzinfo=ET)
+        with pytest.raises(SystemExit, match="no SPX expirations"):
+            pick_expiration(client, "SPX", 0, now=later)

@@ -17,9 +17,19 @@ PUT_CREDIT = "put_credit"
 CALL_CREDIT = "call_credit"
 
 
-def pick_expiration(client: TradierClient, symbol: str, dte: int) -> date:
-    """Nearest listed expiration at least ``dte`` calendar days out."""
-    today = datetime.now(ET).date()
+def pick_expiration(
+    client: TradierClient, symbol: str, dte: int, now: datetime | None = None
+) -> date:
+    """Nearest listed expiration at least ``dte`` calendar days out.
+
+    ``now`` is threaded in rather than read from the wall clock. Every other
+    step of a pass already takes an injected clock, and this one reading the
+    real one meant a pass could select an expiry for a different date than the
+    one its gates were evaluated against -- harmless while both agree, wrong
+    the moment a session runs across midnight ET, and untestable at any date
+    boundary.
+    """
+    today = (now or datetime.now(ET)).date()
     target = today + timedelta(days=dte)
     available = sorted(e for e in client.expirations(symbol) if e >= target)
     if not available:
@@ -196,7 +206,7 @@ def screen(
     if preloaded is not None:
         expiration, spot, T, contracts = preloaded
     else:
-        expiration = pick_expiration(client, cfg.symbol, cfg.dte)
+        expiration = pick_expiration(client, cfg.symbol, cfg.dte, now=now)
         spot, T, contracts = load_chain(client, cfg, expiration, now=now)
 
     regime = measure(client, cfg, spot, contracts, now=now)

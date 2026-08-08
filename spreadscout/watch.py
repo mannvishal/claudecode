@@ -182,7 +182,7 @@ def run_once(
 
     # 4. Regime and gates. The chain is fetched once here and handed to the
     #    screener below, so a pass costs one chain request rather than two.
-    expiration = pick_expiration(client, cfg.symbol, cfg.dte)
+    expiration = pick_expiration(client, cfg.symbol, cfg.dte, now=now)
     spot, T, contracts = load_chain(client, cfg, expiration, now=now)
     preloaded = (expiration, spot, T, contracts)
     regime = measure(client, cfg, spot, contracts, now=now)
