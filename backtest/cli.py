@@ -15,12 +15,15 @@ import logging
 import sys
 from datetime import date
 
+import pandas as pd
+
 from .cache import ParquetCache
 from .config import SCHEMA_DEFINITION, SCHEMA_QUOTES, BacktestConfig
 from .engine import Engine
 from .fills import MidFill, MidMinusEdgeFill
 from .report import render_report
 from .source import (
+    ET as ETZ,
     AgentBridgeFetcher,
     CostCeilingExceeded,
     CostEstimateUnavailable,
@@ -319,6 +322,120 @@ def cmd_advise(args) -> int:
     return 0
 
 
+def cmd_validate(args) -> int:
+    """Phase 2: check the model's strikes against real option quotes.
+
+    The first command in the harness that spends meaningful OPRA money, so it
+    prints its own bill before and after.
+    """
+    from datetime import time as _time
+
+    from .data import QuoteBook, contracts_from_definitions
+    from .rangemodel import RangeModel, VarianceProfile, state_at
+    from .source import session_bounds
+    from .validate import (
+        SCHEMA_VALIDATION_QUOTES,
+        ValidationSummary,
+        check_session,
+        pick_sessions,
+    )
+
+    cfg = _configure(args)
+    cfg.start_date = date.fromisoformat(args.train_start)
+    cfg.end_date = date.fromisoformat(args.end)
+    cfg.validate()
+
+    window_start = date.fromisoformat(args.start)
+    by_day = _load_sessions(args, cfg)
+    if by_day is None:
+        return 1
+
+    train = {d: f for d, f in by_day.items() if d < window_start}
+    candidates = sorted(d for d in by_day if d >= window_start)
+    if len(train) < 60 or not candidates:
+        print(f"need more history: {len(train)} training sessions, "
+              f"{len(candidates)} candidates")
+        return 1
+
+    chosen = pick_sessions(candidates, args.days)
+    profile = VarianceProfile.fit(train)
+    model = RangeModel.fit(train, profile, stride=args.stride)
+    print(f"\nfitted on {len(train)} sessions strictly before {window_start}")
+    print(f"validating {len(chosen)} of {len(candidates)} candidate sessions "
+          f"at {args.at}, {args.confidence:.0%} confidence, "
+          f"{cfg.signal.width_points:.0f}-point wings\n")
+
+    fetcher, cache = _fetcher(cfg, args)
+    spend_before = cache.total_spend()
+
+    clock = _time.fromisoformat(args.at)
+    parent = [cfg.data.parent_symbol]
+    checks = []
+
+    for day in chosen:
+        observed = state_at(by_day[day], clock, profile)
+        if observed is None:
+            print(f"  {day}  no underlying bar at {clock}")
+            continue
+        state, _ = observed
+        z_return = (model.close_quantile(1.0 - args.confidence)
+                    if args.side == "put" else model.close_quantile(args.confidence))
+        target = z_return * state.sigma_remaining
+
+        try:
+            defs, _ = fetcher.fetch(
+                SCHEMA_DEFINITION, day, parent,
+                cfg.data.quote_start, cfg.data.quote_end, stype_in="parent",
+            )
+            contracts = contracts_from_definitions(defs, cfg.data.underlying_root, day)
+            if not contracts:
+                print(f"  {day}  no {cfg.data.underlying_root} contracts expiring today")
+                continue
+
+            lo, hi = session_bounds(day, cfg.data.quote_start, cfg.data.quote_end)
+            frame, _ = fetcher.fetch_window(
+                dataset=cfg.data.dataset, schema=SCHEMA_VALIDATION_QUOTES,
+                symbols=parent, lo=lo, hi=hi, stype_in="parent", key_day=day,
+            )
+        except (CostCeilingExceeded, CostEstimateUnavailable) as exc:
+            print(f"\n  stopped at {day}: {exc}")
+            break
+
+        book = QuoteBook(frame)
+        entry_ts = pd.Timestamp(f"{day} {args.at}", tz=ETZ)
+        check = check_session(
+            day, contracts, book, entry_ts, target, args.side,
+            cfg.signal.width_points, cfg.data.risk_free_rate, cfg.data.dividend_yield,
+        )
+        checks.append(check)
+
+        if check.note:
+            print(f"  {day}  skipped: {check.note}")
+        else:
+            mark = "BREACH" if check.breached else "held"
+            print(f"  {day}  spot {check.spot:>9,.2f}  short {check.short_strike:>8,.0f}"
+                  f"  credit {check.credit:>6.2f}  settle {check.settlement:>9,.2f}  {mark}")
+
+    if not checks:
+        print("\nno sessions checked")
+        return 1
+
+    summary = ValidationSummary(checks, args.confidence)
+    spent = cache.total_spend() - spend_before
+    print(f"\n  {len(summary.tradable)} of {len(checks)} sessions produced a tradable spread")
+    if summary.resolved:
+        print(f"  breaches {summary.breaches}/{len(summary.resolved)} "
+              f"= {summary.breach_rate:.1%}, model implied {summary.expected_breach_rate:.1%}")
+        print(f"  median credit {summary.median_credit:.2f} index points "
+              f"on {cfg.signal.width_points:.0f}-point wings")
+    print(f"  this run spent ${spent:,.2f}")
+    print("\n  A breach rate near the implied rate means the model's confidence")
+    print("  survives contact with listed strikes. The credit is the other half:")
+    print("  a calibrated strike nobody pays for is not a trade. This holds to")
+    print("  settlement with no stop, so it bounds the strategy, not describes one.")
+    return 0
+
+
 def cmd_cache(args) -> int:
     cfg = _configure(args)
     cache = ParquetCache(cfg.data.cache_dir)
@@ -396,6 +513,18 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--reveal", action="store_true",
                    help="also print what actually happened")
     a.set_defaults(func=cmd_advise)
+
+    v = sub.add_parser("validate", parents=[common],
+                       help="check the model's strikes against real option quotes")
+    v.add_argument("--train-start", required=True, help="first session to fit on")
+    v.add_argument("--start", required=True, help="first session to validate")
+    v.add_argument("--end", required=True)
+    v.add_argument("--days", type=int, default=20, help="sessions to sample")
+    v.add_argument("--at", default="11:00")
+    v.add_argument("--confidence", type=float, default=0.95)
+    v.add_argument("--side", choices=["put", "call"], default="put")
+    v.add_argument("--stride", type=int, default=5)
+    v.set_defaults(func=cmd_validate)
 
     k = sub.add_parser("cache", parents=[common], help="what is cached and what it cost")
     k.add_argument("--limit", type=int, default=30)
