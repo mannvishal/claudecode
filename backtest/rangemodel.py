@@ -55,6 +55,10 @@ DEFAULT_QUANTILES = (0.005, 0.01, 0.025, 0.05, 0.10, 0.25, 0.50,
 MIN_VARIANCE_SHARE = 0.02
 MIN_SIGMA = 1e-5
 
+# How many minutes of today's evidence the trailing prior is worth. Half an
+# hour: by 10:00 the session speaks for itself, before then it mostly does not.
+SHRINKAGE_BARS = 30.0
+
 
 @dataclass
 class SessionState:
@@ -81,6 +85,47 @@ class Outcome:
     close_return: float      # close / price - 1
     min_return: float        # lowest excursion from price, <= 0
     max_return: float        # highest excursion from price, >= 0
+
+
+@dataclass
+class VolBaseline:
+    """Trailing daily realized variance, as a prior for the session in progress.
+
+    At 09:35 the day's own realized variance is five minutes of data being
+    asked to describe six and a half hours, and dividing it by the small share
+    of variance elapsed by then multiplies the noise rather than removing it.
+    Measured on ES, that estimator produces normalized outcomes with a standard
+    deviation near 9 in the first hour against 0.85 for the rest of the day --
+    not a fat tail in the market, a fat tail in the estimator.
+
+    So the day's own evidence is blended with what the previous sessions said,
+    weighted by how much of it there is. Strictly backward-looking: the value
+    for a day is an EWMA over sessions *before* it, which is exactly what a
+    trader has at the open.
+    """
+
+    by_day: dict[date, float] = field(default_factory=dict, repr=False)
+    halflife: float = 10.0
+
+    @classmethod
+    def fit(cls, sessions: dict[date, pd.DataFrame], halflife: float = 10.0) -> "VolBaseline":
+        decay = 0.5 ** (1.0 / halflife)
+        out: dict[date, float] = {}
+        ewma, weight = 0.0, 0.0
+        for day in sorted(sessions):
+            # Recorded before today is folded in, so the lookup can never see
+            # its own session.
+            if weight > 0:
+                out[day] = ewma / weight
+            r = np.diff(np.log(sessions[day]["close"].to_numpy()))
+            if len(r) < 2:
+                continue
+            ewma = ewma * decay + float(np.sum(r ** 2))
+            weight = weight * decay + 1.0
+        return cls(by_day=out, halflife=halflife)
+
+    def prior_for(self, day: date) -> float | None:
+        return self.by_day.get(day)
 
 
 @dataclass
@@ -126,8 +171,30 @@ class VarianceProfile:
         return max(float(self.shares[clipped]), MIN_VARIANCE_SHARE)
 
 
+def blend_variance(
+    realized: float, share: float, bars: int, prior: float | None,
+    shrinkage_bars: float = SHRINKAGE_BARS,
+) -> float:
+    """Combine today's realized variance with the trailing prior.
+
+    Weighted by information content rather than by clock time. The sampling
+    variance of a realized-variance estimate falls as 1/n in the number of
+    bars, so precision is proportional to n and the weight on today is
+    ``n / (n + n0)``: ``shrinkage_bars`` is literally how many minutes of
+    today's evidence the prior is worth. By the afternoon today dominates,
+    which is the intended behaviour -- the prior is scaffolding for the open,
+    not a permanent anchor.
+    """
+    own = realized / share
+    if prior is None or prior <= 0:
+        return own
+    weight = bars / (bars + shrinkage_bars)
+    return weight * own + (1.0 - weight) * prior
+
+
 def observe(
     frame: pd.DataFrame, index: int, profile: VarianceProfile,
+    prior_variance: float | None = None,
 ) -> tuple[SessionState, Outcome] | None:
     """Split one session at ``index`` into what was known and what followed.
 
@@ -152,7 +219,7 @@ def observe(
     r = np.diff(np.log(seen))
     realized = float(np.sum(r ** 2))
     share = profile.share_by(index)
-    daily_variance = realized / share
+    daily_variance = blend_variance(realized, share, index, prior_variance)
     remaining_variance = max(daily_variance * (1.0 - share), 0.0)
     sigma_remaining = max(math.sqrt(remaining_variance), MIN_SIGMA)
 
@@ -187,11 +254,13 @@ class RangeModel:
     z_max: np.ndarray = field(default=None, repr=False)
     profile: VarianceProfile | None = field(default=None, repr=False)
     n_observations: int = 0
+    drift_removed: float = 0.0
 
     @classmethod
     def fit(
         cls, sessions: dict[date, pd.DataFrame], profile: VarianceProfile,
         stride: int = 5, quantiles: tuple[float, ...] = DEFAULT_QUANTILES,
+        baseline: "VolBaseline | None" = None,
     ) -> "RangeModel":
         """Pool normalized outcomes across every session and decision minute.
 
@@ -202,9 +271,10 @@ class RangeModel:
         quantile without fitting a curve to noise.
         """
         zc, zmin, zmax = [], [], []
-        for frame in sessions.values():
+        for day, frame in sessions.items():
+            prior = baseline.prior_for(day) if baseline else None
             for index in range(1, len(frame) - 1, stride):
-                observed = observe(frame, index, profile)
+                observed = observe(frame, index, profile, prior)
                 if observed is None:
                     continue
                 state, outcome = observed
@@ -216,13 +286,23 @@ class RangeModel:
         if not zc:
             raise ValueError("no observations; check the session frames")
 
+        z_close = np.array(zc)
+        # Remove the sample's drift rather than projecting it forward. A bull
+        # training period leaves a positive median here, and carrying that into
+        # the strikes tightens the put side precisely because the market has
+        # been rising -- which is the bet that ends a credit-spread book. The
+        # shift is subtracted from the excursion arrays too, so their asymmetry
+        # survives while the directional component does not.
+        drift = float(np.median(z_close))
+
         return cls(
             quantiles=quantiles,
-            z_close=np.array(zc),
-            z_min=np.array(zmin),
-            z_max=np.array(zmax),
+            z_close=z_close - drift,
+            z_min=np.array(zmin) - drift,
+            z_max=np.array(zmax) - drift,
             profile=profile,
             n_observations=len(zc),
+            drift_removed=drift,
         )
 
     # --- reading the model ------------------------------------------------
@@ -295,6 +375,7 @@ class Coverage:
 def calibration(
     model: RangeModel, sessions: dict[date, pd.DataFrame],
     profile: VarianceProfile, stride: int = 5,
+    baseline: "VolBaseline | None" = None,
 ) -> list[Coverage]:
     """Out-of-sample coverage: does "95%" mean 95%?
 
@@ -307,9 +388,10 @@ def calibration(
     """
     actual, predicted_levels = [], {alpha: [] for alpha in model.quantiles}
 
-    for frame in sessions.values():
+    for day, frame in sessions.items():
+        prior = baseline.prior_for(day) if baseline else None
         for index in range(1, len(frame) - 1, stride):
-            observed = observe(frame, index, profile)
+            observed = observe(frame, index, profile, prior)
             if observed is None:
                 continue
             state, outcome = observed
@@ -351,10 +433,11 @@ def split_sessions(
 
 def state_at(
     frame: pd.DataFrame, clock: time, profile: VarianceProfile,
+    prior_variance: float | None = None,
 ) -> tuple[SessionState, Outcome] | None:
     """Observe a session at a wall-clock time rather than a bar index."""
     times = frame["ts"].dt.time
     matching = np.flatnonzero((times <= clock).to_numpy())
     if len(matching) == 0:
         return None
-    return observe(frame, int(matching[-1]), profile)
+    return observe(frame, int(matching[-1]), profile, prior_variance)

@@ -70,11 +70,16 @@ def load_minutes(
     completed multi-year pull leaves whole usable months behind rather than
     having to start over.
     """
-    # One past the last requested day. The final chunk is clamped to this:
-    # asking for a window that runs past the end of the dataset is a 422, not
-    # an empty frame, so an unclamped month boundary would fail the whole pull
-    # for no reason other than the calendar.
+    # One past the last requested day, further clamped to the dataset's live
+    # edge. Asking for a window that runs past either is a 422 for the whole
+    # request, not an empty frame, so an unclamped month boundary fails a pull
+    # that is otherwise entirely valid -- and the live edge is an arbitrary
+    # minute, not a day boundary, so rounding to midnight is not enough.
     stop = pd.Timestamp(end, tz=ET) + pd.Timedelta(days=1)
+    edge = getattr(fetcher, "available_end", lambda _d: None)(ucfg.dataset)
+    if edge is not None and edge < stop:
+        log.info("clamping to the dataset edge at %s", edge)
+        stop = edge
 
     frames = []
     for first in month_starts(start, end):

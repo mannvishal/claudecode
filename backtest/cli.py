@@ -211,7 +211,13 @@ def cmd_calibrate(args) -> int:
     anything. It is deliberately the command you must run before `advise`
     prints a strike.
     """
-    from .rangemodel import RangeModel, VarianceProfile, calibration, split_sessions
+    from .rangemodel import (
+        RangeModel,
+        VarianceProfile,
+        VolBaseline,
+        calibration,
+        split_sessions,
+    )
 
     cfg = _configure(args)
     cfg.start_date = date.fromisoformat(args.start)
@@ -230,11 +236,15 @@ def cmd_calibrate(args) -> int:
         return 1
 
     profile = VarianceProfile.fit(train)
-    model = RangeModel.fit(train, profile, stride=args.stride)
+    # Fitted on every session: it only ever looks strictly backward, so a
+    # test day reading yesterday's volatility is not lookahead, it is what
+    # a trader has at the open.
+    baseline = VolBaseline.fit(by_day)
+    model = RangeModel.fit(train, profile, stride=args.stride, baseline=baseline)
     print(f"variance profile from {profile.n_sessions} sessions, "
           f"model from {model.n_observations:,} observations\n")
 
-    rows = calibration(model, test, profile, stride=args.stride)
+    rows = calibration(model, test, profile, stride=args.stride, baseline=baseline)
     print("  out-of-sample coverage of the close\n")
     print(f"  {'stated':>8s}  {'actual':>8s}  {'error':>8s}")
     worst = 0.0
@@ -256,7 +266,7 @@ def cmd_advise(args) -> int:
     """
     from datetime import time as _time
 
-    from .rangemodel import RangeModel, VarianceProfile, state_at
+    from .rangemodel import RangeModel, VarianceProfile, VolBaseline, state_at
 
     cfg = _configure(args)
     asof = date.fromisoformat(args.date)
@@ -279,10 +289,11 @@ def cmd_advise(args) -> int:
         return 1
 
     profile = VarianceProfile.fit(train)
-    model = RangeModel.fit(train, profile, stride=args.stride)
+    baseline = VolBaseline.fit(by_day)
+    model = RangeModel.fit(train, profile, stride=args.stride, baseline=baseline)
 
     clock = _time.fromisoformat(args.at)
-    observed = state_at(by_day[asof], clock, profile)
+    observed = state_at(by_day[asof], clock, profile, baseline.prior_for(asof))
     if observed is None:
         print(f"no bar at or before {clock} on {asof}")
         return 1
@@ -331,7 +342,7 @@ def cmd_validate(args) -> int:
     from datetime import time as _time
 
     from .data import QuoteBook, contracts_from_definitions
-    from .rangemodel import RangeModel, VarianceProfile, state_at
+    from .rangemodel import RangeModel, VarianceProfile, VolBaseline, state_at
     from .source import session_bounds
     from .validate import (
         SCHEMA_VALIDATION_QUOTES,
@@ -359,7 +370,8 @@ def cmd_validate(args) -> int:
 
     chosen = pick_sessions(candidates, args.days)
     profile = VarianceProfile.fit(train)
-    model = RangeModel.fit(train, profile, stride=args.stride)
+    baseline = VolBaseline.fit(by_day)
+    model = RangeModel.fit(train, profile, stride=args.stride, baseline=baseline)
     print(f"\nfitted on {len(train)} sessions strictly before {window_start}")
     print(f"validating {len(chosen)} of {len(candidates)} candidate sessions "
           f"at {args.at}, {args.confidence:.0%} confidence, "
@@ -373,7 +385,7 @@ def cmd_validate(args) -> int:
     checks = []
 
     for day in chosen:
-        observed = state_at(by_day[day], clock, profile)
+        observed = state_at(by_day[day], clock, profile, baseline.prior_for(day))
         if observed is None:
             print(f"  {day}  no underlying bar at {clock}")
             continue

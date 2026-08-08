@@ -283,6 +283,23 @@ class DatabentoFetcher:
         self.pulls.append(pull)
         return frame, pull
 
+    def available_end(self, dataset: str) -> pd.Timestamp | None:
+        """Last timestamp the entitlement actually covers, or ``None``.
+
+        A dataset's live edge sits at whatever minute it was last appended to,
+        not at a day boundary, and asking past it is a 422 for the whole
+        request rather than a short frame. Callers building calendar-aligned
+        windows need this to clamp the final one; a range that ends a few hours
+        into the future fails a pull that is otherwise entirely valid.
+        """
+        try:
+            span = self.client.metadata.get_dataset_range(dataset=dataset)
+        except Exception as exc:
+            log.warning("could not read the available range for %s: %s", dataset, exc)
+            return None
+        end = span.get("end") if isinstance(span, dict) else None
+        return pd.Timestamp(end).tz_convert(ET) if end else None
+
     # --- arbitrary windows ------------------------------------------------
 
     def fetch_window(

@@ -402,3 +402,87 @@ def _client_error(status):
     from databento.common.error import BentoClientError
 
     return BentoClientError(http_status=status, message=f"{status} bad request")
+
+
+# --------------------------------------------------------------------------
+# The two corrections, and why each is there
+# --------------------------------------------------------------------------
+
+class TestVolBaseline:
+    def test_the_prior_never_sees_its_own_session(self):
+        """Using today's realized vol to scale today's forecast is lookahead."""
+        from backtest.rangemodel import VolBaseline
+
+        ss = synthetic_sessions(20, seed=99)
+        baseline = VolBaseline.fit(ss)
+        first = sorted(ss)[0]
+        assert baseline.prior_for(first) is None
+
+    def test_later_sessions_have_a_prior(self):
+        from backtest.rangemodel import VolBaseline
+
+        ss = synthetic_sessions(20, seed=99)
+        baseline = VolBaseline.fit(ss)
+        assert baseline.prior_for(sorted(ss)[-1]) > 0
+
+    def test_a_calm_history_gives_a_smaller_prior_than_a_wild_one(self):
+        from backtest.rangemodel import VolBaseline
+
+        calm = VolBaseline.fit(synthetic_sessions(30, seed=1, sigma_annual=0.08))
+        wild = VolBaseline.fit(synthetic_sessions(30, seed=1, sigma_annual=0.40))
+        last_calm = sorted(calm.by_day)[-1]
+        assert calm.prior_for(last_calm) < wild.prior_for(last_calm)
+
+
+class TestVarianceShrinkage:
+    def test_early_in_the_session_the_prior_dominates(self):
+        """Five minutes of today cannot describe six and a half hours."""
+        from backtest.rangemodel import blend_variance
+
+        blended = blend_variance(realized=1e-9, share=0.02, bars=5, prior=1e-4)
+        assert blended == pytest.approx(1e-4, rel=0.2)
+
+    def test_late_in_the_session_today_dominates(self):
+        from backtest.rangemodel import blend_variance
+
+        own = 1e-6 / 0.95
+        blended = blend_variance(realized=1e-6, share=0.95, bars=370, prior=1e-3)
+        assert abs(blended - own) < abs(blended - 1e-3)
+
+    def test_without_a_prior_it_is_the_unshrunk_estimate(self):
+        from backtest.rangemodel import blend_variance
+
+        assert blend_variance(4e-6, 0.5, 100, None) == pytest.approx(8e-6)
+
+    def test_a_nonsense_prior_is_ignored(self):
+        from backtest.rangemodel import blend_variance
+
+        assert blend_variance(4e-6, 0.5, 100, 0.0) == pytest.approx(8e-6)
+
+
+class TestDriftRemoval:
+    def test_a_trending_sample_leaves_no_drift_in_the_model(self):
+        """A bull training period must not tighten the put side."""
+        trending = synthetic_sessions(200, seed=77, drift=0.02)
+        profile = VarianceProfile.fit(trending)
+        model = RangeModel.fit(trending, profile, stride=30)
+
+        assert model.drift_removed > 0
+        assert float(np.median(model.z_close)) == pytest.approx(0.0, abs=1e-9)
+
+    def test_removal_preserves_the_spread_of_the_distribution(self):
+        """Centring must shift the distribution, not squash it."""
+        trending = synthetic_sessions(200, seed=77, drift=0.02)
+        profile = VarianceProfile.fit(trending)
+        model = RangeModel.fit(trending, profile, stride=30)
+
+        width = model.close_quantile(0.95) - model.close_quantile(0.05)
+        assert width > 0
+
+    def test_excursions_are_shifted_by_the_same_amount(self):
+        """Otherwise the excursion and close distributions disagree about
+        where zero is, and the turning-point reading drifts against the band."""
+        a = synthetic_sessions(150, seed=41, drift=0.03)
+        profile = VarianceProfile.fit(a)
+        undrifted = RangeModel.fit(a, profile, stride=30)
+        assert undrifted.z_min.max() <= undrifted.z_max.max()
