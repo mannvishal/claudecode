@@ -21,9 +21,16 @@ which skips when ``databento`` is absent. Verified against SDK 0.83.0 --
 ``metadata.get_cost`` and ``timeseries.get_range`` both accept the argument set
 built by ``request_kwargs``, ``to_df()`` indexes on ``ts_recv`` (hence the
 ``reset_index``), and its timestamps arrive in UTC, which is what ``to_eastern``
-converts from. What remains unverified is live behaviour: no request has been
-made against the real endpoint from this environment, because outbound access to
-``hist.databento.com`` is blocked by the egress policy here.
+converts from. ``TestVendorAgreesWithOurConstants`` asks the server the
+questions argument-binding cannot answer, which is how a request for ``mbp-1``
+-- a schema OPRA does not offer -- survived 334 passing tests.
+
+Live behaviour is now partly verified: GLBX bar pulls have been made and parsed
+against this code. OPRA bulk quote responses have not.
+
+What the gate cannot do: ``get_cost`` prices a request, but Databento exposes
+no balance endpoint, so an accurately-priced under-ceiling pull can still be
+refused at purchase for want of funds. That arrives as ``BudgetExhausted``.
 """
 
 from __future__ import annotations
@@ -60,6 +67,34 @@ class CostEstimateUnavailable(RuntimeError):
     An unknown cost is not a zero cost. Proceeding here spends real money on a
     request nobody sized.
     """
+
+
+class BudgetExhausted(RuntimeError):
+    """The vendor refused the request for lack of funds, not for being wrong.
+
+    This is the gap the cost gate structurally cannot close. `get_cost` prices
+    a request; there is no endpoint that reports the account's remaining
+    balance, so a correctly-priced, under-ceiling, thoroughly-sized request can
+    still be refused at the moment of purchase. Worth its own exception because
+    the remedy is neither "narrow the request" nor "retry" -- it is to add funds
+    -- and because a raw 402 traceback in the middle of a long pull reads like a
+    bug in the harness rather than a bill.
+    """
+
+    def __init__(self, describe: str, estimate: float | None):
+        self.estimate = estimate
+        priced = f"priced at ${estimate:,.4f}" if estimate is not None else "unpriced"
+        super().__init__(
+            f"Databento refused {describe} ({priced}): the account has "
+            f"insufficient budget. Nothing was pulled and nothing was billed for "
+            f"it. Add funds or raise the budget cap at "
+            f"https://databento.com/portal/billing, then re-run -- cached pulls "
+            f"are not repeated, so this resumes where it stopped."
+        )
+
+
+def is_insufficient_funds(exc: Exception) -> bool:
+    return getattr(exc, "http_status", None) == 402
 
 
 @dataclass
@@ -261,12 +296,17 @@ class DatabentoFetcher:
             if estimate > self.cfg.cost.ceiling_usd:
                 raise CostCeilingExceeded(estimate, self.cfg.cost.ceiling_usd, describe)
 
-        data = with_retry(
-            lambda: self.client.timeseries.get_range(
-                **self.request_kwargs(schema, day, symbols, start, end, stype_in)
-            ),
-            echo=self.echo,
-        )
+        try:
+            data = with_retry(
+                lambda: self.client.timeseries.get_range(
+                    **self.request_kwargs(schema, day, symbols, start, end, stype_in)
+                ),
+                echo=self.echo,
+            )
+        except Exception as exc:
+            if is_insufficient_funds(exc):
+                raise BudgetExhausted(describe, estimate) from exc
+            raise
         # These three are SDK defaults today, passed explicitly so a future
         # default change cannot silently alter prices, drop the symbol column,
         # or hand us timestamps in a zone `to_eastern` is not expecting.
@@ -354,9 +394,14 @@ class DatabentoFetcher:
             if estimate > self.cfg.cost.ceiling_usd:
                 raise CostCeilingExceeded(estimate, self.cfg.cost.ceiling_usd, describe)
 
-        data = with_retry(
-            lambda: self.client.timeseries.get_range(**kwargs), echo=self.echo
-        )
+        try:
+            data = with_retry(
+                lambda: self.client.timeseries.get_range(**kwargs), echo=self.echo
+            )
+        except Exception as exc:
+            if is_insufficient_funds(exc):
+                raise BudgetExhausted(describe, estimate) from exc
+            raise
         frame = data.to_df(price_type="float", map_symbols=True, tz=UTC).reset_index()
         frame = to_eastern(frame)
 

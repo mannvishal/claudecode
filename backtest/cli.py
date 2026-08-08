@@ -25,6 +25,7 @@ from .report import render_report
 from .source import (
     ET as ETZ,
     AgentBridgeFetcher,
+    BudgetExhausted,
     CostCeilingExceeded,
     CostEstimateUnavailable,
     DatabentoFetcher,
@@ -91,6 +92,9 @@ def cmd_smoke(args) -> int:
 
     try:
         result = engine.run_day(day)
+    except BudgetExhausted as exc:
+        print(f"\nSTOPPED: {exc}", file=sys.stderr)
+        return 4
     except (CostCeilingExceeded, CostEstimateUnavailable) as exc:
         print(f"\nSTOPPED: {exc}", file=sys.stderr)
         return 2
@@ -120,6 +124,9 @@ def cmd_run(args) -> int:
 
     try:
         results = engine.run(cfg.start_date, cfg.end_date)
+    except BudgetExhausted as exc:
+        print(f"\nSTOPPED: {exc}", file=sys.stderr)
+        return 4
     except (CostCeilingExceeded, CostEstimateUnavailable) as exc:
         print(f"\nSTOPPED: {exc}", file=sys.stderr)
         return 2
@@ -383,6 +390,7 @@ def cmd_validate(args) -> int:
     clock = _time.fromisoformat(args.at)
     parent = [cfg.data.parent_symbol]
     checks = []
+    budget_stop = False
 
     for day in chosen:
         observed = state_at(by_day[day], clock, profile, baseline.prior_for(day))
@@ -409,6 +417,10 @@ def cmd_validate(args) -> int:
                 dataset=cfg.data.dataset, schema=SCHEMA_VALIDATION_QUOTES,
                 symbols=parent, lo=lo, hi=hi, stype_in="parent", key_day=day,
             )
+        except BudgetExhausted as exc:
+            print(f"\n  stopped at {day}: {exc}")
+            budget_stop = True
+            break
         except (CostCeilingExceeded, CostEstimateUnavailable) as exc:
             print(f"\n  stopped at {day}: {exc}")
             break
@@ -430,7 +442,7 @@ def cmd_validate(args) -> int:
 
     if not checks:
         print("\nno sessions checked")
-        return 1
+        return 4 if budget_stop else 1
 
     summary = ValidationSummary(checks, args.confidence)
     spent = cache.total_spend() - spend_before

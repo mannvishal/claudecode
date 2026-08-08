@@ -486,3 +486,35 @@ class TestDriftRemoval:
         profile = VarianceProfile.fit(a)
         undrifted = RangeModel.fit(a, profile, stride=30)
         assert undrifted.z_min.max() <= undrifted.z_max.max()
+
+
+class TestBudgetExhaustion:
+    """A 402 is a bill, not a bug, and must not read like one."""
+
+    def test_insufficient_funds_is_recognised(self):
+        from backtest.source import is_insufficient_funds
+
+        assert is_insufficient_funds(_client_error(402))
+        assert not is_insufficient_funds(_client_error(422))
+        assert not is_insufficient_funds(_server_error(504))
+
+    def test_insufficient_funds_is_not_retried(self):
+        """Retrying a 402 cannot make the account solvent."""
+        from backtest.source import is_transient
+
+        assert not is_transient(_client_error(402))
+
+    def test_the_message_says_what_to_do_about_it(self):
+        from backtest.source import BudgetExhausted
+
+        exc = BudgetExhausted("cbbo-1m 2026-02-02 on OPRA.PILLAR", 0.9254)
+        text = str(exc)
+        assert "billing" in text
+        assert "0.9254" in text
+        # The remedy is funds, not a narrower request or a higher ceiling.
+        assert "ceiling" not in text.lower()
+
+    def test_an_unpriced_refusal_still_explains_itself(self):
+        from backtest.source import BudgetExhausted
+
+        assert "unpriced" in str(BudgetExhausted("some pull", None))
