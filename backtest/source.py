@@ -125,6 +125,41 @@ def definition_bounds(day: date) -> tuple[pd.Timestamp, pd.Timestamp]:
     return lo, lo + pd.Timedelta(days=1)
 
 
+def is_transient(exc: Exception) -> bool:
+    """Whether a failed request is worth repeating.
+
+    `BentoServerError` is the SDK's 5xx class -- the gateway timing out on a
+    large range says nothing about whether the request was valid, and a
+    multi-month pull is long enough that hitting one is routine. A 4xx is the
+    opposite: the request is wrong and repeating it wastes time and money.
+    """
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    status = getattr(exc, "http_status", None)
+    return isinstance(status, int) and 500 <= status < 600
+
+
+def with_retry(call, attempts: int = 5, base_delay: float = 2.0, echo=print):
+    """Run ``call``, repeating transient failures with exponential backoff.
+
+    Deliberately not applied to cost estimation: ``estimate_cost`` already
+    treats failure as "unpriced", and an unpriced pull is refused rather than
+    retried into a purchase.
+    """
+    import time as _time
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as exc:
+            if attempt == attempts or not is_transient(exc):
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            echo(f"  transient {type(exc).__name__} ({exc}); "
+                 f"retry {attempt}/{attempts - 1} in {delay:.0f}s")
+            _time.sleep(delay)
+
+
 class Fetcher(Protocol):
     def fetch(
         self, schema: str, day: date, symbols: list[str] | None,
@@ -226,8 +261,11 @@ class DatabentoFetcher:
             if estimate > self.cfg.cost.ceiling_usd:
                 raise CostCeilingExceeded(estimate, self.cfg.cost.ceiling_usd, describe)
 
-        data = self.client.timeseries.get_range(
-            **self.request_kwargs(schema, day, symbols, start, end, stype_in)
+        data = with_retry(
+            lambda: self.client.timeseries.get_range(
+                **self.request_kwargs(schema, day, symbols, start, end, stype_in)
+            ),
+            echo=self.echo,
         )
         # These three are SDK defaults today, passed explicitly so a future
         # default change cannot silently alter prices, drop the symbol column,
@@ -242,6 +280,72 @@ class DatabentoFetcher:
 
         pull = Pull(self.cfg.data.dataset, schema, day, symbols, len(frame), estimate, False)
         self.cache.write(key, frame, meta={"cost_usd": estimate, "stype_in": stype_in})
+        self.pulls.append(pull)
+        return frame, pull
+
+    # --- arbitrary windows ------------------------------------------------
+
+    def fetch_window(
+        self, dataset: str, schema: str, symbols: list[str] | None,
+        lo: pd.Timestamp, hi: pd.Timestamp, stype_in: str, key_day: date,
+    ) -> tuple[pd.DataFrame, Pull]:
+        """Pull one explicit time window from any dataset, under the same gate.
+
+        ``fetch`` is shaped around one option session: a day, a session window,
+        and the OPRA dataset from config. Underlying bars are neither -- they
+        come from a different dataset and are far cheaper per unit time, so
+        requesting them a day at a time would mean hundreds of round trips for
+        data that costs fractions of a cent. The caller chooses the chunking and
+        supplies ``key_day`` as the cache identity for the chunk.
+
+        The cost gate, the cache-first rule and the spend manifest are the same
+        code path as ``fetch``; only the window construction differs.
+        """
+        key = CacheKey.build(dataset, schema, key_day, symbols)
+        if self.cache.has(key):
+            frame = self.cache.read(key)
+            pull = Pull(dataset, schema, key_day, symbols, len(frame), None, True)
+            self.pulls.append(pull)
+            self.echo(f"  cache hit  {pull.describe()}")
+            return frame, pull
+
+        kwargs = {
+            "dataset": dataset,
+            "schema": schema,
+            "symbols": symbols or "ALL_SYMBOLS",
+            "stype_in": stype_in,
+            "start": lo.tz_convert(UTC).to_pydatetime(),
+            "end": hi.tz_convert(UTC).to_pydatetime(),
+        }
+        describe = f"{schema} {lo.date()}..{hi.date()} on {dataset}"
+
+        try:
+            estimate = float(self.client.metadata.get_cost(**kwargs))
+        except Exception as exc:
+            log.warning("cost estimate failed for %s: %s", describe, exc)
+            estimate = None
+
+        if estimate is None:
+            self.echo(f"  COST ESTIMATE UNAVAILABLE for {describe}")
+            if self.cfg.cost.require_estimate:
+                raise CostEstimateUnavailable(
+                    f"could not price {describe}, and cost.require_estimate is on. "
+                    f"An unknown cost is not a zero cost."
+                )
+        else:
+            self.echo(f"  cost estimate ${estimate:,.4f} for {describe}")
+            if estimate > self.cfg.cost.ceiling_usd:
+                raise CostCeilingExceeded(estimate, self.cfg.cost.ceiling_usd, describe)
+
+        data = with_retry(
+            lambda: self.client.timeseries.get_range(**kwargs), echo=self.echo
+        )
+        frame = data.to_df(price_type="float", map_symbols=True, tz=UTC).reset_index()
+        frame = to_eastern(frame)
+
+        pull = Pull(dataset, schema, key_day, symbols, len(frame), estimate, False)
+        self.cache.write(key, frame, meta={"cost_usd": estimate, "stype_in": stype_in,
+                                           "window": f"{lo.isoformat()}..{hi.isoformat()}"})
         self.pulls.append(pull)
         return frame, pull
 

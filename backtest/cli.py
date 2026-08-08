@@ -1,9 +1,11 @@
 """Backtest CLI.
 
-    smoke     run one date end-to-end and print the trade log (rule 8)
-    run       run a date range
-    cost      price a range without pulling anything
-    cache     show what is cached and what it cost
+    smoke      run one date end-to-end and print the trade log (rule 8)
+    run        run a date range
+    cost       price a range without pulling anything
+    calibrate  fit the range model and report out-of-sample coverage
+    advise     strike bands for one session, from underlying bars only
+    cache      show what is cached and what it cost
 """
 
 from __future__ import annotations
@@ -186,6 +188,137 @@ def cmd_cost(args) -> int:
     return 0
 
 
+def _load_sessions(args, cfg):
+    """Underlying sessions for the requested range, pulled or read from cache."""
+    from .underlying import UnderlyingConfig, load_minutes, sessions
+
+    ucfg = UnderlyingConfig()
+    fetcher, _cache = _fetcher(cfg, args)
+    bars = load_minutes(fetcher, ucfg, cfg.start_date, cfg.end_date)
+    if bars.empty:
+        print("no underlying bars in that range")
+        return None
+    return sessions(bars)
+
+
+def cmd_calibrate(args) -> int:
+    """Fit the range model and report out-of-sample coverage.
+
+    The only question this answers is whether the model's confidence means
+    anything. It is deliberately the command you must run before `advise`
+    prints a strike.
+    """
+    from .rangemodel import RangeModel, VarianceProfile, calibration, split_sessions
+
+    cfg = _configure(args)
+    cfg.start_date = date.fromisoformat(args.start)
+    cfg.end_date = date.fromisoformat(args.end)
+    cfg.validate()
+
+    by_day = _load_sessions(args, cfg)
+    if by_day is None:
+        return 1
+
+    train, test = split_sessions(by_day, args.train_fraction)
+    print(f"\n{len(by_day)} sessions: {len(train)} train, {len(test)} test "
+          f"(chronological split at {sorted(train)[-1] if train else '-'})")
+    if not train or not test:
+        print("not enough sessions to split; widen the range")
+        return 1
+
+    profile = VarianceProfile.fit(train)
+    model = RangeModel.fit(train, profile, stride=args.stride)
+    print(f"variance profile from {profile.n_sessions} sessions, "
+          f"model from {model.n_observations:,} observations\n")
+
+    rows = calibration(model, test, profile, stride=args.stride)
+    print("  out-of-sample coverage of the close\n")
+    print(f"  {'stated':>8s}  {'actual':>8s}  {'error':>8s}")
+    worst = 0.0
+    for row in sorted(rows, key=lambda r: r.alpha):
+        worst = max(worst, abs(row.error))
+        print(f"  {row.alpha:>8.1%}  {row.empirical:>8.1%}  {row.error:>+8.2%}")
+    print(f"\n  {rows[0].n:,} held-out observations, worst absolute error {worst:.2%}")
+    print("\n  A well-calibrated model puts 'actual' on top of 'stated'. Errors in")
+    print("  the lower tail matter most: that is where a put spread's short strike")
+    print("  sits, and an understated tail sells strikes that breach too often.")
+    return 0
+
+
+def cmd_advise(args) -> int:
+    """What the model says about one session, at one moment.
+
+    Reads history up to the given time only. It cannot see the rest of the day,
+    which is the entire point.
+    """
+    from datetime import time as _time
+
+    from .rangemodel import RangeModel, VarianceProfile, state_at
+
+    cfg = _configure(args)
+    asof = date.fromisoformat(args.date)
+    cfg.start_date = date.fromisoformat(args.train_start)
+    cfg.end_date = asof
+    cfg.validate()
+
+    by_day = _load_sessions(args, cfg)
+    if by_day is None:
+        return 1
+    if asof not in by_day:
+        print(f"no session for {asof} (holiday, or bars not available)")
+        return 1
+
+    # Strictly prior sessions: fitting on the day being advised would be
+    # lookahead of the most flattering kind.
+    train = {d: f for d, f in by_day.items() if d < asof}
+    if len(train) < 60:
+        print(f"only {len(train)} prior sessions; widen --train-start")
+        return 1
+
+    profile = VarianceProfile.fit(train)
+    model = RangeModel.fit(train, profile, stride=args.stride)
+
+    clock = _time.fromisoformat(args.at)
+    observed = state_at(by_day[asof], clock, profile)
+    if observed is None:
+        print(f"no bar at or before {clock} on {asof}")
+        return 1
+    state, outcome = observed
+
+    print(f"\n{asof} at {state.at.strftime('%H:%M %Z')}   "
+          f"fitted on {len(train)} prior sessions")
+    print(f"  price {state.price:,.2f}   from open {state.return_from_open:+.2%}   "
+          f"{state.minutes_left} min to close")
+    print(f"  session range so far {state.low_so_far:,.2f} .. {state.high_so_far:,.2f}")
+    print(f"  remaining-day sigma {state.sigma_remaining:.3%}\n")
+
+    print("  short strikes by confidence the close respects them\n")
+    print(f"  {'confidence':>10s}  {'put below':>12s}  {'call above':>12s}")
+    for confidence in (0.80, 0.90, 0.95, 0.975, 0.99):
+        put = model.short_strike(state, "put", confidence)
+        call = model.short_strike(state, "call", confidence)
+        print(f"  {confidence:>10.1%}  {put:>12,.2f}  {call:>12,.2f}")
+
+    low_in = model.probability_low_is_in(state)
+    high_in = model.probability_high_is_in(state)
+    print(f"\n  P(today's low is already in)   {low_in:.1%}")
+    print(f"  P(today's high is already in)  {high_in:.1%}")
+
+    if args.reveal:
+        actual = state.price * (1.0 + outcome.close_return)
+        print(f"\n  --reveal: the close was {actual:,.2f} "
+              f"({outcome.close_return:+.2%}), "
+              f"excursions {outcome.min_return:+.2%} / {outcome.max_return:+.2%}")
+    else:
+        print("\n  (--reveal shows what actually happened; kept off by default so")
+        print("   reading the advice is not contaminated by knowing the answer)")
+
+    print("\n  These are model levels, not listed strikes, and they assume only")
+    print("  that today resembles the fitted sample. Nothing here has been")
+    print("  checked against an option price -- see `cost` before pulling OPRA.")
+    return 0
+
+
 def cmd_cache(args) -> int:
     cfg = _configure(args)
     cache = ParquetCache(cfg.data.cache_dir)
@@ -243,6 +376,26 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--start", required=True)
     c.add_argument("--end", required=True)
     c.set_defaults(func=cmd_cost)
+
+    cal = sub.add_parser("calibrate", parents=[common],
+                         help="fit the range model and report out-of-sample coverage")
+    cal.add_argument("--start", required=True)
+    cal.add_argument("--end", required=True)
+    cal.add_argument("--train-fraction", type=float, default=0.7)
+    cal.add_argument("--stride", type=int, default=5,
+                     help="minutes between decision points sampled per session")
+    cal.set_defaults(func=cmd_calibrate)
+
+    a = sub.add_parser("advise", parents=[common],
+                       help="strike bands for one session at one time of day")
+    a.add_argument("--date", required=True, help="session to advise, YYYY-MM-DD")
+    a.add_argument("--at", default="11:00", help="time of day, HH:MM")
+    a.add_argument("--train-start", required=True,
+                   help="first session to fit on; only days before --date are used")
+    a.add_argument("--stride", type=int, default=5)
+    a.add_argument("--reveal", action="store_true",
+                   help="also print what actually happened")
+    a.set_defaults(func=cmd_advise)
 
     k = sub.add_parser("cache", parents=[common], help="what is cached and what it cost")
     k.add_argument("--limit", type=int, default=30)
