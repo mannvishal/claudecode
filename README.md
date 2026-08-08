@@ -319,23 +319,48 @@ spreadscout-backtest smoke --date 2026-07-15                     # one session
 spreadscout-backtest run   --start 2026-07-01 --end 2026-07-31 --out trades.csv
 ```
 
-**This will not work from a Claude Code web/remote session** unless the
-environment's network policy allows `hist.databento.com` — see
-[docs/databento-setup.md](docs/databento-setup.md) for the exact steps and the
-order to verify things in. Outbound access there
-is governed by the sandbox egress proxy, which currently refuses the CONNECT:
+**From a Claude Code web/remote session** this needs an environment whose
+network policy allows `hist.databento.com` — see
+[docs/databento-setup.md](docs/databento-setup.md) for the exact steps, the real
+per-session costs, and the three request bugs that only a live response could
+expose. On your own machine none of the sandbox setup applies.
 
-```
-{"kind": "connect_rejected", "host": "hist.databento.com:443",
- "detail": "gateway answered 403 to CONNECT (policy denial...)"}
+`api.tradier.com` is blocked by the same default policy, which is why the live
+tool's Tradier access runs through an MCP server rather than direct HTTP — MCP
+servers execute outside the sandbox.
+
+## The intraday advisor
+
+The question "have we bottomed or peaked today" is a question about the
+**underlying**, not the option chain — and ES continuous minute bars cost about
+$0.0014 a session against ~$17.69 for the SPXW quote chain. Signal research
+therefore happens on bars; OPRA money is spent only to confirm that a validated
+signal picks spreads somebody was actually willing to pay for.
+
+```bash
+# Fit the range model and prove its confidence means something, out of sample.
+spreadscout-backtest calibrate --start 2023-01-01 --end 2026-08-07
+
+# What it says about one session at one moment. Reads no bar after --at.
+spreadscout-backtest advise --date 2026-08-06 --at 11:00 --train-start 2023-01-01
+
+# Only once calibrated: check those strikes against real option quotes.
+spreadscout-backtest validate --train-start 2023-01-01 \
+    --start 2026-02-01 --end 2026-08-07 --days 20
 ```
 
-`api.tradier.com` is blocked the same way, which is why the live tool's Tradier
-access runs through an MCP server rather than direct HTTP — MCP servers execute
-outside the sandbox. To run the backtest in a remote session you would need to
-allow that host in the environment's network policy
-([docs](https://code.claude.com/docs/en/claude-code-on-the-web)). On your own
-machine none of this applies and it works today.
+The model does **not** predict the turn. A point call on the intraday high or
+low is the least reliable thing to ask of this data and the easiest to overfit —
+any rule can be tuned to catch the turns in a sample you have already seen. What
+a credit spread actually needs is the distribution of the remaining-day move,
+which is what picks the strike. "The low is probably in" then falls out of the
+excursion distribution as a consequence rather than being asserted, and `advise`
+prints it as a probability rather than a verdict.
+
+The only claim made is a calibration claim: when the model says 95%, it should
+be right 95% of the time on sessions it was not fitted on. That is falsifiable
+in a way "did it call the low" is not, and `calibrate` reports it whether or not
+it flatters the model.
 
 ### How far the adapter is verified
 
@@ -346,11 +371,14 @@ machine none of this applies and it works today.
 | `to_df()` indexes on `ts_recv` | Confirmed — hence `reset_index()` |
 | `to_df()` returns UTC | Confirmed — what `to_eastern` converts from |
 | Float prices, `symbol` column | Pinned explicitly rather than left to defaults |
-| **Live response behaviour** | **Not verified** — no request has ever left this environment |
+| Dataset and schemas exist | Asked of the server; free metadata calls |
+| Live bar responses | Confirmed — GLBX minute bars pulled and parsed |
+| **Live OPRA quote responses** | **Not yet** — no bulk chain request has been made |
 
-`TestSdkConformance` runs these checks whenever the SDK is installed and skips
-when it isn't, so an SDK upgrade that renames a parameter fails in CI rather than
-partway through a paid multi-day pull.
+`TestSdkConformance` binds argument shapes whenever the SDK is installed.
+`TestVendorAgreesWithOurConstants` asks the server the questions binding cannot
+answer — that is the gap that let a request for `mbp-1`, a schema OPRA does not
+offer, pass 334 tests.
 
 ## Layout
 
