@@ -348,3 +348,75 @@ class TestMidCredit:
         c = check_session(DAY, contracts, book, ENTRY, -0.0075, "put",
                           25.0, 0.04, 0.013)
         assert c.credit_mid == pytest.approx(c.credit)
+
+
+class TestShortStrikeMustBeOutOfTheMoney:
+    """An ITM short is a sign error wearing the costume of enormous edge.
+
+    A 5-wide spread 74 points OTM cannot be worth 4.80. It can only reach that
+    by selling something in the money, which is what happens when one side's
+    quantile is used for the other. The credit then approaches the full width
+    and reads as free money rather than as a bug.
+    """
+
+    SPOT = 6375.0
+    STRIKES = (6275, 6300, 6325, 6350, 6375, 6400, 6425, 6450, 6475)
+
+    def _chain_and_book(self):
+        """Quotes obeying parity, so the implied spot lands where intended.
+
+        Giving every strike the same call and put quote makes them all equally
+        ATM, and parity then picks whichever comes first -- which is how a
+        fixture ends up testing something other than what it claims.
+        """
+        contracts = chain(list(self.STRIKES))
+        rows = []
+        for k in self.STRIKES:
+            call_mid = max(self.SPOT - k, 0.0) + 2.0
+            put_mid = max(k - self.SPOT, 0.0) + 2.0
+            rows.append((osi_symbol("SPXW", DAY, CALL, k), call_mid - 0.2, call_mid + 0.2))
+            rows.append((osi_symbol("SPXW", DAY, PUT, k), put_mid - 0.2, put_mid + 0.2))
+        return contracts, book_from(rows)
+
+    def test_the_fixture_implies_the_intended_spot(self):
+        """Guards the guard: the rest of this class means nothing otherwise."""
+        from backtest.data import spot_from_parity
+
+        contracts, book = self._chain_and_book()
+        spot = spot_from_parity(book.snapshot(ENTRY), contracts, 0.04, 1e-4)
+        assert spot == pytest.approx(self.SPOT, abs=1.0)
+
+    def test_an_itm_put_short_is_refused(self):
+        contracts, book = self._chain_and_book()
+        check = check_session(DAY, contracts, book, ENTRY, +0.01, "put",
+                              25.0, 0.04, 0.013)
+        assert "in the money" in check.note
+        assert not check.tradable
+
+    def test_an_itm_call_short_is_refused(self):
+        contracts, book = self._chain_and_book()
+        check = check_session(DAY, contracts, book, ENTRY, -0.01, "call",
+                              25.0, 0.04, 0.013)
+        assert "in the money" in check.note
+        assert not check.tradable
+
+    def test_a_correctly_sided_put_is_accepted(self):
+        contracts, book = self._chain_and_book()
+        check = check_session(DAY, contracts, book, ENTRY, -0.01, "put",
+                              25.0, 0.04, 0.013)
+        assert not check.note
+        assert check.short_strike < check.spot
+
+    def test_a_correctly_sided_call_is_accepted(self):
+        contracts, book = self._chain_and_book()
+        check = check_session(DAY, contracts, book, ENTRY, +0.01, "call",
+                              25.0, 0.04, 0.013)
+        assert not check.note
+        assert check.short_strike > check.spot
+
+    def test_an_otm_credit_cannot_approach_the_full_width(self):
+        """The symptom that exposed the bug, asserted directly."""
+        contracts, book = self._chain_and_book()
+        check = check_session(DAY, contracts, book, ENTRY, -0.01, "put",
+                              25.0, 0.04, 0.013)
+        assert check.credit < check.wing_width

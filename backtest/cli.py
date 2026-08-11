@@ -584,7 +584,11 @@ def cmd_sweep(args) -> int:
     print(f"  {'conf':>5s} {'OTM':>6s} {'breach':>7s} {'B/E':>6s} "
           f"{'mid':>6s} {'cross':>6s} {'edge@mid':>9s} {'edge@cross':>11s}")
     for confidence in SWEEP_CONFIDENCES:
-        z = model.close_quantile(1.0 - confidence)
+        # Each side reads its own tail. Using the lower quantile for a call puts
+        # the strike below spot, which sells an in-the-money option and books
+        # near-maximum credit as though it were edge.
+        z = (model.close_quantile(1.0 - confidence) if args.side == "put"
+             else model.close_quantile(confidence))
         checks, otm = [], []
         for day, (contracts, book, state) in context.items():
             check = check_session(

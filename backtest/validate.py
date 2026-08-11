@@ -162,6 +162,15 @@ def check_session(
         return _empty(day, entry_ts, side, f"no listed {side} strike at {level:,.0f}",
                       spot=spot, model_level=level)
 
+    # A credit spread sells an out-of-the-money option. A short strike on the
+    # wrong side of spot is in the money, and its credit approaches the full
+    # width -- which reads as enormous edge rather than as the sign error it
+    # is. Refuse rather than price it.
+    if (side == "put" and short.strike > spot) or (side == "call" and short.strike < spot):
+        return _empty(day, entry_ts, side,
+                      f"{side} short {short.strike:,.0f} is in the money "
+                      f"against spot {spot:,.2f}", spot=spot, model_level=level)
+
     long_leg = wing(contracts, option_type, short, width)
     if long_leg is None or long_leg.strike == short.strike:
         return _empty(day, entry_ts, side, "no wing at the configured width",
