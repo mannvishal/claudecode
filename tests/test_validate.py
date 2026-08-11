@@ -181,3 +181,81 @@ class TestSummary:
         """Zero would read as a perfect record."""
         summary = ValidationSummary([], confidence=0.95)
         assert summary.breach_rate != summary.breach_rate  # NaN
+
+
+class TestActualWingWidth:
+    """SPX lists 5-point strikes near the money and sparser ones further out.
+
+    A 5-point wing requested 70 points OTM can come back 25 wide, which is five
+    times the risk under the same label. Nothing may quietly use the requested
+    width in place of the obtained one.
+    """
+
+    def _check(self, short, long_, credit=0.40, settlement=6350.0, side="put"):
+        from backtest.validate import SpreadCheck
+
+        breached = (settlement < short) if side == "put" else (settlement > short)
+        return SpreadCheck(
+            day=DAY, entry_ts=ENTRY, side=side, spot=6400.0, model_level=short,
+            short_strike=short, long_strike=long_, credit=credit,
+            settlement=settlement, breached=breached,
+        )
+
+    def test_width_is_measured_not_assumed(self):
+        assert self._check(6300, 6295).wing_width == pytest.approx(5.0)
+        assert self._check(6300, 6275).wing_width == pytest.approx(25.0)
+
+    def test_max_loss_uses_the_obtained_width(self):
+        assert self._check(6300, 6275, credit=0.40).max_loss == pytest.approx(24.6)
+
+    def test_a_mismatched_wing_is_reported(self):
+        summary = ValidationSummary(
+            [self._check(6300, 6295), self._check(6300, 6275)], confidence=0.95)
+        assert len(summary.wrong_width(5.0)) == 1
+
+    def test_matching_wings_report_nothing(self):
+        summary = ValidationSummary(
+            [self._check(6300, 6295), self._check(6250, 6245)], confidence=0.95)
+        assert summary.wrong_width(5.0) == []
+
+
+class TestRealisedExpectancy:
+    def _check(self, short, long_, credit, settlement, side="put"):
+        from backtest.validate import SpreadCheck
+
+        breached = (settlement < short) if side == "put" else (settlement > short)
+        return SpreadCheck(
+            day=DAY, entry_ts=ENTRY, side=side, spot=6400.0, model_level=short,
+            short_strike=short, long_strike=long_, credit=credit,
+            settlement=settlement, breached=breached,
+        )
+
+    def test_a_held_spread_earns_its_credit(self):
+        s = ValidationSummary([self._check(6300, 6295, 0.40, 6350.0)], 0.95)
+        assert s.expectancy() == pytest.approx(0.40)
+
+    def test_a_breach_beyond_the_long_strike_loses_the_full_width(self):
+        s = ValidationSummary([self._check(6300, 6295, 0.40, 6200.0)], 0.95)
+        assert s.expectancy() == pytest.approx(0.40 - 5.0)
+
+    def test_a_breach_between_the_strikes_is_only_a_partial_loss(self):
+        """Cash settlement means a close inside the spread is not a full loss.
+        Charging the full width would understate the strategy by more than the
+        credit being measured."""
+        s = ValidationSummary([self._check(6300, 6295, 0.40, 6298.0)], 0.95)
+        assert s.expectancy() == pytest.approx(0.40 - 2.0)
+
+    def test_call_side_intrinsic_runs_the_other_way(self):
+        s = ValidationSummary(
+            [self._check(6300, 6305, 0.40, 6302.0, side="call")], 0.95)
+        assert s.expectancy() == pytest.approx(0.40 - 2.0)
+
+    def test_expectancy_averages_over_resolved_sessions(self):
+        s = ValidationSummary([
+            self._check(6300, 6295, 0.40, 6350.0),
+            self._check(6300, 6295, 0.40, 6200.0),
+        ], 0.95)
+        assert s.expectancy() == pytest.approx((0.40 + 0.40 - 5.0) / 2)
+
+    def test_no_resolved_sessions_gives_none(self):
+        assert ValidationSummary([], 0.95).expectancy() is None

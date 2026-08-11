@@ -66,6 +66,22 @@ class SpreadCheck:
     note: str = ""
 
     @property
+    def wing_width(self) -> float:
+        """The width actually obtained, which is not always the one requested.
+
+        SPX lists 5-point strikes near the money and sparser ones further out,
+        so a 5-point wing asked for 70 points OTM can come back 25 wide. That
+        is five times the risk under the same label, so every number derived
+        from width reads this rather than the configured value.
+        """
+        return abs(self.short_strike - self.long_strike)
+
+    @property
+    def max_loss(self) -> float:
+        """Defined risk in index points, from the width actually obtained."""
+        return self.wing_width - self.credit
+
+    @property
     def tradable(self) -> bool:
         return self.credit > 0 and not self.note
 
@@ -225,8 +241,43 @@ class ValidationSummary:
 
     @property
     def median_credit(self) -> float:
-        credits = sorted(c.credit for c in self.tradable)
-        if not credits:
-            return float("nan")
-        mid = len(credits) // 2
-        return credits[mid] if len(credits) % 2 else (credits[mid - 1] + credits[mid]) / 2
+        return _median([c.credit for c in self.tradable])
+
+    @property
+    def median_width(self) -> float:
+        return _median([c.wing_width for c in self.tradable])
+
+    def wrong_width(self, requested: float) -> list[SpreadCheck]:
+        """Sessions where the chain could not supply the requested wing."""
+        return [c for c in self.tradable if abs(c.wing_width - requested) > 1e-6]
+
+    def expectancy(self) -> float | None:
+        """Points per spread, from what actually happened -- no model input.
+
+        A breach is charged its real cost rather than the full width: 0DTE SPX
+        settles in cash, so a close between the strikes is a partial loss, and
+        assuming total loss on every breach understates the strategy by more
+        than the credit it is trying to measure.
+        """
+        resolved = self.resolved
+        if not resolved:
+            return None
+        total = 0.0
+        for c in resolved:
+            if not c.breached:
+                total += c.credit
+                continue
+            if c.side == "put":
+                intrinsic = min(max(c.short_strike - c.settlement, 0.0), c.wing_width)
+            else:
+                intrinsic = min(max(c.settlement - c.short_strike, 0.0), c.wing_width)
+            total += c.credit - intrinsic
+        return total / len(resolved)
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return float("nan")
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2

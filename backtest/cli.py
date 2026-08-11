@@ -363,6 +363,8 @@ def cmd_validate(args) -> int:
     cfg.end_date = date.fromisoformat(args.end)
     cfg.validate()
 
+    if args.width is not None:
+        cfg.signal.width_points = args.width
     window_start = date.fromisoformat(args.start)
     by_day = _load_sessions(args, cfg)
     if by_day is None:
@@ -437,8 +439,11 @@ def cmd_validate(args) -> int:
             print(f"  {day}  skipped: {check.note}")
         else:
             mark = "BREACH" if check.breached else "held"
+            flag = "" if abs(check.wing_width - cfg.signal.width_points) < 1e-6 \
+                else f"  [wing {check.wing_width:,.0f}pt]"
             print(f"  {day}  spot {check.spot:>9,.2f}  short {check.short_strike:>8,.0f}"
-                  f"  credit {check.credit:>6.2f}  settle {check.settlement:>9,.2f}  {mark}")
+                  f"  credit {check.credit:>6.2f}  settle {check.settlement:>9,.2f}"
+                  f"  {mark}{flag}")
 
     if not checks:
         print("\nno sessions checked")
@@ -450,13 +455,34 @@ def cmd_validate(args) -> int:
     if summary.resolved:
         print(f"  breaches {summary.breaches}/{len(summary.resolved)} "
               f"= {summary.breach_rate:.1%}, model implied {summary.expected_breach_rate:.1%}")
-        print(f"  median credit {summary.median_credit:.2f} index points "
-              f"on {cfg.signal.width_points:.0f}-point wings")
-    print(f"  this run spent ${spent:,.2f}")
-    print("\n  A breach rate near the implied rate means the model's confidence")
-    print("  survives contact with listed strikes. The credit is the other half:")
-    print("  a calibrated strike nobody pays for is not a trade. This holds to")
-    print("  settlement with no stop, so it bounds the strategy, not describes one.")
+        print(f"  median credit {summary.median_credit:.2f} index points, "
+              f"median wing {summary.median_width:,.0f} points")
+
+        mismatched = summary.wrong_width(cfg.signal.width_points)
+        if mismatched:
+            # Silence here would report five times the risk under the label of
+            # the width that was asked for.
+            print(f"  NOTE {len(mismatched)} of {len(summary.tradable)} sessions could not "
+                  f"supply a {cfg.signal.width_points:,.0f}-point wing; "
+                  f"widths above are what the chain actually listed")
+
+        expectancy = summary.expectancy()
+        if expectancy is not None:
+            legs = 2 * cfg.execution.per_leg_cost / cfg.execution.contract_multiplier
+            net = expectancy - legs
+            print(f"\n  realised expectancy {expectancy:+.3f} points per spread "
+                  f"({expectancy * cfg.execution.contract_multiplier:+,.0f} per contract)")
+            print(f"  after {legs:.3f} points of commission: {net:+.3f} points "
+                  f"({net * cfg.execution.contract_multiplier:+,.0f} per contract)")
+            print(f"  on median risk {summary.median_width - summary.median_credit:,.2f} points "
+                  f"= {(summary.median_width - summary.median_credit) * cfg.execution.contract_multiplier:,.0f} per contract")
+    print(f"\n  this run spent ${spent:,.2f}")
+    print("\n  Expectancy charges each breach its real settlement cost, not the")
+    print("  full width -- these are cash-settled, so a close between the strikes")
+    print("  is a partial loss. It holds to settlement with no stop and samples")
+    print(f"  {len(summary.resolved)} sessions at one entry time, so it bounds the")
+    print("  strategy rather than describing one. At this sample size the credit")
+    print("  is the trustworthy number; the breach rate is not.")
     return 0
 
 
@@ -544,6 +570,8 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--start", required=True, help="first session to validate")
     v.add_argument("--end", required=True)
     v.add_argument("--days", type=int, default=20, help="sessions to sample")
+    v.add_argument("--width", type=float,
+                   help="wing width in index points (default: config)")
     v.add_argument("--at", default="11:00")
     v.add_argument("--confidence", type=float, default=0.95)
     v.add_argument("--side", choices=["put", "call"], default="put")
