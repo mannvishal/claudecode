@@ -442,3 +442,26 @@ class AgentBridgeFetcher:
         self.pulls.append(pull)
         self.echo(f"  cache hit  {pull.describe()}")
         return frame, pull
+
+    def fetch_window(
+        self, dataset: str, schema: str, symbols: list[str] | None,
+        lo: pd.Timestamp, hi: pd.Timestamp, stype_in: str, key_day: date,
+    ) -> tuple[pd.DataFrame, Pull]:
+        """Cache-only counterpart of the SDK fetcher's window pull.
+
+        Without this, offline mode cannot read underlying bars at all -- which
+        defeats the point of a mode whose whole purpose is to re-analyse data
+        already paid for without touching the network.
+        """
+        key = CacheKey.build(dataset, schema, key_day, symbols)
+        if not self.cache.has(key):
+            raise KeyError(
+                f"offline mode: no cached {schema} for {key_day} at "
+                f"{self.cache.path_for(key)}. Populate the cache first, or run "
+                f"with the SDK fetcher."
+            )
+        frame = self.cache.read(key)
+        pull = Pull(dataset, schema, key_day, symbols, len(frame), None, True)
+        self.pulls.append(pull)
+        self.echo(f"  cache hit  {pull.describe()}")
+        return frame, pull
