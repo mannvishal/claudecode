@@ -259,3 +259,61 @@ class TestRealisedExpectancy:
 
     def test_no_resolved_sessions_gives_none(self):
         assert ValidationSummary([], 0.95).expectancy() is None
+
+
+class TestVendorSymbology:
+    """OPRA pads the root; our parser does not. Both spellings must join.
+
+    This is the failure that 411 tests missed and live data hit on every one
+    of 430 contracts: the chain present, the quotes present, and not a single
+    lookup connecting them. It cost six sessions of paid data to find.
+    """
+
+    def test_the_feed_spelling_is_padded(self):
+        from backtest.fixtures import vendor_symbol
+
+        assert vendor_symbol("SPXW", DAY, PUT, 6300.0) == "SPXW  260806P06300000"
+
+    def test_canonical_collapses_the_padding(self):
+        from backtest.data import canonical_symbol
+
+        assert (canonical_symbol("SPXW  260806P06300000")
+                == canonical_symbol("SPXW260806P06300000")
+                == "SPXW260806P06300000")
+
+    def test_a_book_built_from_feed_symbols_answers_parsed_ones(self):
+        from backtest.fixtures import vendor_symbol
+
+        padded = vendor_symbol("SPXW", DAY, PUT, 6300.0)
+        book = book_from([(padded, 3.0, 3.4)])
+        parsed = Contract.parse(padded)
+
+        assert book.as_of(parsed.symbol, ENTRY) is not None
+        assert parsed.symbol in book.snapshot(ENTRY)
+
+    def test_a_contract_keeps_the_feed_spelling_for_requests(self):
+        """Sent back as a raw_symbol, the canonical form is a name OPRA does
+        not list."""
+        parsed = Contract.parse("SPXW  260806P06300000")
+        assert parsed.raw == "SPXW  260806P06300000"
+        assert parsed.symbol == "SPXW260806P06300000"
+
+    def test_a_contract_built_by_hand_defaults_raw_to_its_symbol(self):
+        made = Contract(symbol="SPXW260806P06300000", root="SPXW",
+                        expiration=DAY, option_type=PUT, strike=6300.0)
+        assert made.raw == made.symbol
+
+    def test_parity_survives_the_round_trip(self):
+        """The end-to-end join: definitions in feed spelling, quotes in feed
+        spelling, contracts parsed, spot recovered."""
+        from backtest.data import contracts_from_definitions, spot_from_parity
+        from backtest.fixtures import build_session
+
+        defs, quotes, _ = build_session(DAY, open_price=5000.0)
+        contracts = contracts_from_definitions(defs, "SPXW", DAY)
+        book = QuoteBook(quotes)
+        snap = book.snapshot(quotes["ts_recv"].iloc[len(quotes) // 2])
+
+        spot = spot_from_parity(snap, contracts, 0.04, 0.01)
+        assert spot is not None
+        assert 4800 < spot < 5200

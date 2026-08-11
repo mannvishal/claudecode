@@ -21,6 +21,18 @@ from spreadscout.pricing import bs_price
 from .data import CALL, PUT, osi_symbol
 from .source import ET
 
+
+def vendor_symbol(root: str, day: date, option_type: str, strike: float) -> str:
+    """OSI as OPRA actually spells it: root padded to six characters.
+
+    The fixtures previously emitted the *parsed* spelling -- what our own code
+    produces rather than what the feed sends. That made a symbology mismatch
+    between the quote book and the chain invisible to every test, while live
+    data missed on all 430 contracts of a session. A fixture easier to match
+    than the real thing is not testing the match.
+    """
+    return f"{root:<6}{osi_symbol('', day, option_type, strike)}"
+
 SESSION_OPEN = time(9, 45)
 SESSION_CLOSE = time(16, 0)
 
@@ -58,7 +70,7 @@ def make_definitions(day: date, strikes: list[float], root: str = "SPXW") -> pd.
         for option_type in (PUT, CALL):
             rows.append({
                 "ts_recv": pd.Timestamp(datetime.combine(day, time(0, 0))).tz_localize(ET),
-                "raw_symbol": osi_symbol(root, day, option_type, strike),
+                "raw_symbol": vendor_symbol(root, day, option_type, strike),
                 "instrument_class": "P" if option_type == PUT else "C",
                 "strike_price": strike,
                 "expiration": pd.Timestamp(day),
@@ -85,7 +97,7 @@ def make_mbp1(
                 rows.append({
                     "ts_recv": ts,
                     "ts_event": ts,
-                    "symbol": osi_symbol(root, day, option_type, strike),
+                    "symbol": vendor_symbol(root, day, option_type, strike),
                     "bid_px_00": bid,
                     "ask_px_00": ask,
                     "bid_sz_00": 25,

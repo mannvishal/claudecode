@@ -32,15 +32,30 @@ IMPLAUSIBLE_PRICE = 1e6
 
 @dataclass(frozen=True)
 class Contract:
+    """One listed option, in both spellings of its name.
+
+    ``symbol`` is canonical and is what every internal lookup uses. ``raw`` is
+    the vendor's own spelling, preserved exactly as received, and is what must
+    be sent back to Databento as a ``raw_symbol``: OPRA pads the root to six
+    characters, and a request built from the canonical form asks for symbols
+    the feed does not recognise.
+    """
+
     symbol: str
     root: str
     expiration: date
     option_type: str
     strike: float
+    raw: str = ""
+
+    def __post_init__(self):
+        if not self.raw:
+            object.__setattr__(self, "raw", self.symbol)
 
     @classmethod
     def parse(cls, symbol: str) -> "Contract | None":
-        match = OSI_RE.match(symbol.strip().upper().replace(" ", ""))
+        cleaned = symbol.strip().upper()
+        match = OSI_RE.match(cleaned.replace(" ", ""))
         if not match:
             return None
         ymd = match.group("ymd")
@@ -49,17 +64,31 @@ class Contract:
         except ValueError:
             return None
         return cls(
-            symbol=symbol.strip().upper().replace(" ", ""),
+            symbol=cleaned.replace(" ", ""),
             root=match.group("root"),
             expiration=expiry,
             option_type=CALL if match.group("cp") == "C" else PUT,
             strike=int(match.group("strike")) / 1000.0,
+            raw=cleaned,
         )
 
 
 def osi_symbol(root: str, expiry: date, option_type: str, strike: float) -> str:
     cp = "C" if option_type == CALL else "P"
     return f"{root}{expiry:%y%m%d}{cp}{int(round(strike * 1000)):08d}"
+
+
+def canonical_symbol(symbol: str) -> str:
+    """One spelling of an OSI symbol, so two feeds can be compared.
+
+    OPRA pads the root to six characters -- ``SPXW  260202P06300000`` -- while
+    ``Contract.parse`` and ``osi_symbol`` both normalise the padding away. Keying
+    quotes on the vendor's spelling and looking them up by the parsed one means
+    every lookup misses silently: the chain is present, the quotes are present,
+    and not one contract finds its price. Every symbol crossing a boundary goes
+    through here.
+    """
+    return symbol.strip().upper().replace(" ", "")
 
 
 @dataclass(frozen=True)
@@ -138,20 +167,36 @@ class QuoteBook:
             if col in work.columns:
                 work[col] = _rescale(work[col])
 
+        # Canonical keys: the vendor pads the root, the parser does not, and a
+        # book keyed one way but read the other answers every lookup with None.
+        work["symbol"] = work["symbol"].astype(str).map(canonical_symbol)
+
         work = work.sort_values(ts_col)
+        # Column arrays rather than row objects. A full-chain session is several
+        # million rows, and `iterrows` materialises a Series per row -- enough to
+        # turn one session into minutes of pure overhead.
+        for column, default in (("bid_px_00", 0.0), ("ask_px_00", 0.0),
+                                ("bid_sz_00", 0), ("ask_sz_00", 0)):
+            if column not in work.columns:
+                work[column] = default
+        work = work.fillna({"bid_px_00": 0.0, "ask_px_00": 0.0,
+                            "bid_sz_00": 0, "ask_sz_00": 0})
+
         for symbol, group in work.groupby("symbol", sort=False):
+            stamps = list(group[ts_col])
             quotes = [
-                Quote(
-                    ts=row[ts_col],
-                    bid=float(row.get("bid_px_00") or 0.0),
-                    ask=float(row.get("ask_px_00") or 0.0),
-                    bid_size=int(row.get("bid_sz_00") or 0),
-                    ask_size=int(row.get("ask_sz_00") or 0),
+                Quote(ts=ts, bid=float(bid), ask=float(ask),
+                      bid_size=int(bsz), ask_size=int(asz))
+                for ts, bid, ask, bsz, asz in zip(
+                    stamps,
+                    group["bid_px_00"].to_numpy(),
+                    group["ask_px_00"].to_numpy(),
+                    group["bid_sz_00"].to_numpy(),
+                    group["ask_sz_00"].to_numpy(),
                 )
-                for _, row in group.iterrows()
             ]
             self._by_symbol[symbol] = quotes
-            self._times[symbol] = [q.ts for q in quotes]
+            self._times[symbol] = stamps
 
     @property
     def symbols(self) -> list[str]:
@@ -162,13 +207,14 @@ class QuoteBook:
 
     def as_of(self, symbol: str, ts: pd.Timestamp) -> Quote | None:
         """Last quote at or before ``ts``. ``None`` if the book had not opened."""
-        times = self._times.get(symbol)
+        key = canonical_symbol(symbol)
+        times = self._times.get(key)
         if not times:
             return None
         idx = bisect_right(times, ts) - 1
         if idx < 0:
             return None
-        return self._by_symbol[symbol][idx]
+        return self._by_symbol[key][idx]
 
     def snapshot(self, ts: pd.Timestamp) -> dict[str, Quote]:
         out = {}

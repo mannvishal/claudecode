@@ -427,7 +427,11 @@ def cmd_validate(args) -> int:
             print(f"\n  stopped at {day}: {exc}")
             break
 
-        book = QuoteBook(frame)
+        # The pull is the whole SPXW parent -- every expiry listed that day, of
+        # which today's is a fortieth. Narrowing before the book is built turns
+        # six million rows into a hundred and forty thousand.
+        wanted = {c.raw for c in contracts}
+        book = QuoteBook(frame[frame["symbol"].isin(wanted)])
         entry_ts = pd.Timestamp(f"{day} {args.at}", tz=ETZ)
         check = check_session(
             day, contracts, book, entry_ts, target, args.side,

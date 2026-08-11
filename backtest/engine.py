@@ -101,7 +101,7 @@ class Engine:
         )
         return contracts_from_definitions(frame, self.cfg.data.underlying_root, day)
 
-    def _band_symbols(self, contracts: list[Contract], anchor: float) -> list[str]:
+    def _band_contracts(self, contracts: list[Contract], anchor: float) -> list[Contract]:
         """Restrict the quote pull to strikes that could plausibly be traded.
 
         This is the difference between a manageable request and an unusable one.
@@ -115,7 +115,10 @@ class Engine:
         # Widen by the wing width so the long legs are inside the pull.
         lo -= self.cfg.signal.width_points
         hi += self.cfg.signal.width_points
-        return [c.symbol for c in contracts if lo <= c.strike <= hi]
+        # Returns contracts, not names. The request needs the vendor's spelling
+        # and every lookup afterwards needs the canonical one; deriving both
+        # from one list is what stops them describing different sets.
+        return [c for c in contracts if lo <= c.strike <= hi]
 
     def _quotes(self, day: date, symbols: list[str]) -> QuoteBook:
         frame, _ = self.fetcher.fetch(
@@ -150,15 +153,13 @@ class Engine:
         if anchor is None:
             return SessionResult(day, skipped="could not anchor a strike band")
 
-        symbols = self._band_symbols(contracts, anchor)
-        if not symbols:
+        in_band = self._band_contracts(contracts, anchor)
+        if not in_band:
             return SessionResult(day, skipped=f"no strikes within the band around {anchor:g}")
 
-        book = self._quotes(day, symbols)
+        book = self._quotes(day, [c.raw for c in in_band])
         if len(book) == 0:
             return SessionResult(day, skipped="no quotes returned")
-
-        in_band = [c for c in contracts if c.symbol in set(symbols)]
         entry_ts = entry_timestamp(day, self.cfg.signal.entry_time)
         snapshot = book.snapshot(entry_ts)
         if not snapshot:
