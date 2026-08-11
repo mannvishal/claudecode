@@ -118,6 +118,94 @@ def baseline_comparison(res, bars, hold_minutes: int | None = None) -> dict:
     }
 
 
+def by_year(res) -> pd.DataFrame:
+    """Year-by-year P&L.
+
+    The question a multi-year sample exists to answer: is this one regime that
+    happened to work, or something that repeats? A strategy carried by 2020 and
+    2022 is a volatility bet wearing a signal's clothes.
+    """
+    df = res.frame()
+    if df.empty:
+        return df
+    df = df.copy()
+    df["year"] = pd.to_datetime(df["exit_ts"]).dt.year
+    rows = []
+    for year, part in df.groupby("year"):
+        r = part["ret"].to_numpy(float)
+        lo, hi = bootstrap_ci(r)
+        rows.append(
+            {
+                "year": int(year),
+                "trades": len(part),
+                "win_rate": float((part["pnl"] > 0).mean()),
+                "mean_trade_bps": r.mean() * 1e4,
+                "ci_lo_bps": lo * 1e4,
+                "ci_hi_bps": hi * 1e4,
+                "total_pnl": float(part["pnl"].sum()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def walk_forward(
+    sig_bars, signals, long_bars, short_bars, base: BacktestConfig,
+    stops=(0.005, 0.01, 0.015, 0.02, 0.03, 0.05),
+    targets=(0.0, 0.005, 0.01, 0.02, 0.03),
+    split: float = 0.5,
+) -> dict:
+    """Pick the best (stop, target) on the first `split` of the tape, then score
+    that choice on the rest.
+
+    This is the only honest way to read a parameter grid. A grid over 30 cells on
+    one sample will always show a winner; the out-of-sample column says whether
+    the winner was signal or the luckiest draw.
+    """
+    n = len(sig_bars)
+    cut = int(n * split)
+    cut_ts = sig_bars["ts"].iloc[cut]
+
+    def scoped(res, lo, hi):
+        """Re-score a full-sample result over one date window."""
+        df = res.frame()
+        if df.empty:
+            return None
+        m = (pd.to_datetime(df["exit_ts"]) >= lo) & (pd.to_datetime(df["exit_ts"]) < hi)
+        return df[m]
+
+    lo_all = pd.to_datetime(sig_bars["ts"].iloc[0])
+    hi_all = pd.to_datetime(sig_bars["ts"].iloc[-1]) + pd.Timedelta(minutes=1)
+
+    best, best_pnl = None, -np.inf
+    cache = {}
+    for stop, tp in itertools.product(stops, targets):
+        res = run_backtest(sig_bars, signals, long_bars, short_bars,
+                           replace(base, stop_pct=stop, take_profit_pct=tp))
+        cache[(stop, tp)] = res
+        train = scoped(res, lo_all, cut_ts)
+        if train is None or train.empty:
+            continue
+        if train["pnl"].sum() > best_pnl:
+            best_pnl, best = train["pnl"].sum(), (stop, tp)
+
+    if best is None:
+        return {}
+    test = scoped(cache[best], cut_ts, hi_all)
+    train = scoped(cache[best], lo_all, cut_ts)
+    t_ret = test["ret"].to_numpy(float) if test is not None and not test.empty else np.array([])
+    lo, hi = bootstrap_ci(t_ret) if len(t_ret) > 1 else (float("nan"), float("nan"))
+    return {
+        "split_at": str(cut_ts),
+        "best_in_sample": {"stop_pct": best[0] * 100, "target_pct": best[1] * 100},
+        "in_sample_trades": int(len(train)),
+        "in_sample_pnl": float(train["pnl"].sum()),
+        "out_of_sample_trades": int(len(t_ret)),
+        "out_of_sample_pnl": float(test["pnl"].sum()) if len(t_ret) else 0.0,
+        "out_of_sample_mean_bps": float(t_ret.mean() * 1e4) if len(t_ret) else float("nan"),
+        "out_of_sample_ci_bps": (lo * 1e4, hi * 1e4),
+    }
+
+
 def split_half(res) -> pd.DataFrame:
     """First half vs second half of the trade sequence.
 

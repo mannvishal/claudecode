@@ -22,7 +22,63 @@ SESSIONS = {
 OHLCV = ["open", "high", "low", "close", "volume"]
 
 
-def load_bars(path: str, symbol: str, session: str = "eth") -> pd.DataFrame:
+def detect_splits(df: pd.DataFrame, threshold: float = 0.25) -> pd.DataFrame:
+    """Find overnight price ratios too large to be a real move.
+
+    Databento's `ohlcv-1m` is AS-TRADED: no split adjustment. This matters more
+    here than in most projects, because both instruments have split -- TQQQ
+    forward, SQQQ repeatedly in reverse as decay grinds its price down. An
+    unadjusted 1-for-5 reverse split is a +400% overnight bar, which the score
+    reads as a genuine move and the backtest happily trades.
+
+    A 3x leveraged ETF can gap perhaps 15% on a violent open, so a 25% default
+    threshold separates splits from tape without needing a corporate-actions
+    feed. Returns one row per suspected split with the implied ratio.
+    """
+    daily = df.groupby("date").agg(first_open=("open", "first"), last_close=("close", "last"))
+    ratio = daily["first_open"] / daily["last_close"].shift(1)
+    hits = ratio[(ratio - 1).abs() > threshold].dropna()
+    if hits.empty:
+        return pd.DataFrame(columns=["date", "observed", "ratio"])
+
+    # The observed gap is (true split ratio) x (1 + the real overnight move), so
+    # using it raw would bake that night's return into the adjustment factor and
+    # erase it from the series. Snap to the nearest standard ratio instead and
+    # let the residual stay in the tape as the genuine move it was. SQQQ's
+    # 2019-05-24 gap of 3.89 is a 1-for-4 reverse split on a -2.7% night, not a
+    # 1-for-5 on a -22% one.
+    candidates = np.array([2, 3, 4, 5, 6, 8, 10, 20], dtype=float)
+    candidates = np.concatenate([candidates, 1.0 / candidates])
+    snapped = []
+    for value in hits.to_numpy():
+        best = candidates[np.argmin(np.abs(np.log(candidates) - np.log(value)))]
+        snapped.append(best)
+    return pd.DataFrame({"date": hits.index, "observed": hits.to_numpy(), "ratio": snapped})
+
+
+def apply_split_adjustment(df: pd.DataFrame, splits: pd.DataFrame) -> pd.DataFrame:
+    """Back-adjust prices so the series is continuous across each split.
+
+    Everything before a split is multiplied by the ratio, which puts the whole
+    history on the post-split scale. Volume is scaled inversely so notional is
+    preserved -- the volume-climax z-score is a within-session statistic, but
+    leaving volume unscaled would still put a discontinuity in the series.
+    """
+    if splits.empty:
+        return df
+    df = df.copy()
+    factor = pd.Series(1.0, index=df.index)
+    for _, row in splits.iterrows():
+        earlier = df["date"] < pd.Timestamp(row["date"])
+        factor = factor * np.where(earlier, row["ratio"], 1.0)
+    for col in ("open", "high", "low", "close"):
+        df[col] = df[col] * factor
+    df["volume"] = df["volume"] / factor
+    return df
+
+
+def load_bars(path: str, symbol: str, session: str = "eth",
+              adjust_splits: bool = True) -> pd.DataFrame:
     """Load 1-minute bars for one symbol, clipped to `session`.
 
     Returns a frame sorted by timestamp with `ts` (tz-aware Eastern), `date`,
@@ -43,6 +99,11 @@ def load_bars(path: str, symbol: str, session: str = "eth") -> pd.DataFrame:
 
     lo, hi = SESSIONS[session]
     df = df[(df["minute"] >= lo) & (df["minute"] < hi)].reset_index(drop=True)
+
+    splits = detect_splits(df)
+    if adjust_splits and not splits.empty:
+        df = apply_split_adjustment(df, splits)
+    df.attrs["splits"] = splits
     df.attrs["session"] = session
     df.attrs["anchor"] = lo
     df.attrs["symbol"] = symbol

@@ -65,6 +65,77 @@ def test_buckets_are_monotonic_and_restart_each_day():
     assert len(set(b[:per_day])) == per_day / 15
 
 
+# --------------------------------------------------------------------------
+# Splits. Databento's ohlcv-1m is as-traded, and both instruments have split --
+# TQQQ 2:1 three times, SQQQ 1-for-5 (and once 1-for-4) five times. Left raw,
+# each one is a several-hundred-percent overnight bar the strategy would trade.
+# --------------------------------------------------------------------------
+
+def _with_split(df: pd.DataFrame, on_day: int, ratio: float) -> pd.DataFrame:
+    """Un-adjust a clean frame: divide everything from `on_day` onward."""
+    df = df.copy()
+    days = sorted(df["date"].unique())
+    later = df["date"] >= days[on_day]
+    for col in ("open", "high", "low", "close"):
+        df.loc[later, col] = df.loc[later, col] / ratio
+    return df
+
+
+def test_detects_a_forward_split():
+    from tqsq.bars import detect_splits
+
+    raw = _with_split(synth(6), on_day=3, ratio=2.0)  # TQQQ-style 2:1
+    hits = detect_splits(raw)
+    assert len(hits) == 1
+    assert hits["ratio"].iloc[0] == pytest.approx(0.5)
+
+
+def test_detects_a_reverse_split():
+    from tqsq.bars import detect_splits
+
+    raw = _with_split(synth(6), on_day=3, ratio=1 / 5)  # SQQQ-style 1-for-5
+    hits = detect_splits(raw)
+    assert len(hits) == 1
+    assert hits["ratio"].iloc[0] == pytest.approx(5.0)
+
+
+def test_split_ratio_snaps_to_a_standard_value():
+    """The observed gap carries that night's real move; snapping keeps the move
+    in the tape instead of burying it in the adjustment factor."""
+    from tqsq.bars import detect_splits
+
+    # A 1-for-4 reverse split on a -2.7% night, which is SQQQ 2019-05-24.
+    raw = _with_split(synth(6), on_day=3, ratio=1 / 4)
+    days = sorted(raw["date"].unique())
+    raw.loc[raw["date"] >= days[3], ["open", "high", "low", "close"]] *= 0.973
+    hits = detect_splits(raw)
+    assert hits["ratio"].iloc[0] == pytest.approx(4.0), "must not snap to 5"
+    assert hits["observed"].iloc[0] != pytest.approx(4.0)
+
+
+def test_adjustment_removes_the_artificial_gap():
+    from tqsq.bars import apply_split_adjustment, detect_splits
+
+    clean = synth(6)
+    raw = _with_split(clean, on_day=3, ratio=2.0)
+    fixed = apply_split_adjustment(raw, detect_splits(raw))
+    assert detect_splits(fixed).empty
+    # Returns are what the score reads, and they must match the unsplit tape.
+    np.testing.assert_allclose(
+        fixed["close"].pct_change().dropna().to_numpy(),
+        clean["close"].pct_change().dropna().to_numpy(),
+        atol=1e-9,
+    )
+
+
+def test_a_violent_but_real_gap_is_not_treated_as_a_split():
+    """A 3x ETF gapped 17.5% on 2020-03-13. The threshold must clear that."""
+    from tqsq.bars import detect_splits
+
+    raw = _with_split(synth(6), on_day=3, ratio=1 / 1.175)
+    assert detect_splits(raw).empty
+
+
 def test_aggregate_preserves_ohlc_semantics():
     df = synth(1)
     b = bucket_ids(df, 5, anchor=SESSIONS["rth"][0])
