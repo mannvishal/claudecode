@@ -376,6 +376,7 @@ def calibration(
     model: RangeModel, sessions: dict[date, pd.DataFrame],
     profile: VarianceProfile, stride: int = 5,
     baseline: "VolBaseline | None" = None,
+    alphas: tuple[float, ...] | None = None,
 ) -> list[Coverage]:
     """Out-of-sample coverage: does "95%" mean 95%?
 
@@ -386,7 +387,8 @@ def calibration(
     often than its confidence implies, which is precisely how a credit-spread
     book dies.
     """
-    actual, predicted_levels = [], {alpha: [] for alpha in model.quantiles}
+    targets = tuple(alphas) if alphas else model.quantiles
+    actual, predicted_levels = [], {alpha: [] for alpha in targets}
 
     for day, frame in sessions.items():
         prior = baseline.prior_for(day) if baseline else None
@@ -396,7 +398,7 @@ def calibration(
                 continue
             state, outcome = observed
             actual.append(outcome.close_return)
-            for alpha in model.quantiles:
+            for alpha in targets:
                 predicted_levels[alpha].append(
                     model.close_quantile(alpha) * state.sigma_remaining
                 )
@@ -414,6 +416,25 @@ def calibration(
         )
         for alpha, levels in predicted_levels.items()
     ]
+
+
+def measured_breach_rates(
+    model: RangeModel, sessions: dict[date, pd.DataFrame],
+    profile: VarianceProfile, confidences: tuple[float, ...],
+    stride: int = 5, baseline: "VolBaseline | None" = None,
+) -> dict[float, float]:
+    """How often each stated confidence was actually wrong, out of sample.
+
+    Comparing a credit against the *nominal* breach rate judges the trade
+    against a probability the model has already been shown not to hold: it runs
+    conservative, so a nominal 5% is nearer 2%. Using the nominal figure would
+    reject spreads that are in fact fairly priced. This is the number a
+    breakeven belongs against.
+    """
+    alphas = tuple(1.0 - c for c in confidences)
+    rows = calibration(model, sessions, profile, stride, baseline, alphas)
+    by_alpha = {row.alpha: row.empirical for row in rows}
+    return {c: by_alpha.get(1.0 - c, float("nan")) for c in confidences}
 
 
 def split_sessions(

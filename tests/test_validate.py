@@ -317,3 +317,34 @@ class TestVendorSymbology:
         spot = spot_from_parity(snap, contracts, 0.04, 0.01)
         assert spot is not None
         assert 4800 < spot < 5200
+
+
+class TestMidCredit:
+    """The gap between crossing and mid decides what a negative result means."""
+
+    def _setup(self, sbid, sask, lbid, lask):
+        contracts = chain([6300, 6325, 6350, 6375, 6400])
+        return contracts, book_from([
+            (osi_symbol("SPXW", DAY, CALL, 6375), 10.0, 10.2),
+            (osi_symbol("SPXW", DAY, PUT, 6375), 10.0, 10.2),
+            (osi_symbol("SPXW", DAY, PUT, 6325), sbid, sask),
+            (osi_symbol("SPXW", DAY, PUT, 6300), lbid, lask),
+        ])
+
+    def test_mid_credit_uses_both_midpoints(self):
+        contracts, book = self._setup(3.00, 3.40, 1.00, 1.30)
+        c = check_session(DAY, contracts, book, ENTRY, -0.0075, "put",
+                          25.0, 0.04, 0.013)
+        assert c.credit_mid == pytest.approx(3.20 - 1.15)
+
+    def test_mid_credit_exceeds_the_crossing_credit(self):
+        contracts, book = self._setup(3.00, 3.40, 1.00, 1.30)
+        c = check_session(DAY, contracts, book, ENTRY, -0.0075, "put",
+                          25.0, 0.04, 0.013)
+        assert c.credit_mid > c.credit
+
+    def test_a_zero_width_market_makes_them_equal(self):
+        contracts, book = self._setup(3.00, 3.00, 1.00, 1.00)
+        c = check_session(DAY, contracts, book, ENTRY, -0.0075, "put",
+                          25.0, 0.04, 0.013)
+        assert c.credit_mid == pytest.approx(c.credit)

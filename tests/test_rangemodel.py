@@ -518,3 +518,38 @@ class TestBudgetExhaustion:
         from backtest.source import BudgetExhausted
 
         assert "unpriced" in str(BudgetExhausted("some pull", None))
+
+
+class TestMeasuredBreachRates:
+    """A credit must be judged against the breach rate the model achieved.
+
+    Judging it against the nominal rate rejects fairly-priced spreads, because
+    the model runs conservative -- a stated 5% came in nearer 2% out of sample.
+    """
+
+    def test_rates_are_returned_for_each_confidence(self, many_sessions):
+        from backtest.rangemodel import measured_breach_rates
+
+        train, test = split_sessions(many_sessions, 0.7)
+        profile = VarianceProfile.fit(train)
+        model = RangeModel.fit(train, profile, stride=30)
+        rates = measured_breach_rates(model, test, profile, (0.90, 0.95), stride=30)
+
+        assert set(rates) == {0.90, 0.95}
+        assert all(0.0 <= v <= 1.0 for v in rates.values())
+
+    def test_a_higher_confidence_breaches_less(self, many_sessions):
+        from backtest.rangemodel import measured_breach_rates
+
+        train, test = split_sessions(many_sessions, 0.7)
+        profile = VarianceProfile.fit(train)
+        model = RangeModel.fit(train, profile, stride=30)
+        rates = measured_breach_rates(model, test, profile, (0.75, 0.95), stride=30)
+        assert rates[0.95] <= rates[0.75]
+
+    def test_calibration_accepts_arbitrary_alphas(self, many_sessions):
+        train, test = split_sessions(many_sessions, 0.7)
+        profile = VarianceProfile.fit(train)
+        model = RangeModel.fit(train, profile, stride=30)
+        rows = calibration(model, test, profile, 30, None, (0.123, 0.456))
+        assert sorted(r.alpha for r in rows) == [0.123, 0.456]

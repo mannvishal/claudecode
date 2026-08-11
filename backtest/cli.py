@@ -490,6 +490,143 @@ def cmd_validate(args) -> int:
     return 0
 
 
+SWEEP_CONFIDENCES = (0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95)
+
+
+def cmd_sweep(args) -> int:
+    """Where on the confidence curve, if anywhere, does the trade pay?
+
+    Runs entirely off cached sessions by default, because the pull is a sunk
+    cost per day: one session of quotes covers every strike, so sweeping the
+    curve costs nothing once the data is bought. This is the command that
+    answers whether a strike exists worth selling, rather than whether one
+    particular strike was.
+    """
+    from datetime import time as _time
+
+    from .data import QuoteBook, contracts_from_definitions
+    from .rangemodel import (
+        RangeModel,
+        VarianceProfile,
+        VolBaseline,
+        measured_breach_rates,
+        state_at,
+    )
+    from .source import session_bounds
+    from .validate import SCHEMA_VALIDATION_QUOTES, ValidationSummary, check_session
+
+    cfg = _configure(args)
+    if args.width is not None:
+        cfg.signal.width_points = args.width
+    cfg.start_date = date.fromisoformat(args.train_start)
+    cfg.end_date = date.fromisoformat(args.end)
+    cfg.validate()
+    window_start = date.fromisoformat(args.start)
+
+    by_day = _load_sessions(args, cfg)
+    if by_day is None:
+        return 1
+    train = {d: f for d, f in by_day.items() if d < window_start}
+    held_out = {d: f for d, f in by_day.items() if d >= window_start}
+    if len(train) < 60 or not held_out:
+        print("not enough history to fit and hold out")
+        return 1
+
+    profile = VarianceProfile.fit(train)
+    baseline = VolBaseline.fit(by_day)
+    model = RangeModel.fit(train, profile, stride=args.stride, baseline=baseline)
+
+    # Which sessions do we actually hold option data for? Only those can be
+    # priced, and the sweep is deliberately confined to them so it never
+    # triggers a pull the user did not ask for.
+    fetcher, cache = _fetcher(cfg, args)
+    have = sorted(cache.cached_days(cfg.data.dataset, SCHEMA_VALIDATION_QUOTES)
+                  & set(held_out))
+    if not have:
+        print(f"no cached {SCHEMA_VALIDATION_QUOTES} sessions in that window; "
+              f"run `validate` first")
+        return 1
+
+    print(f"\nsweeping {len(have)} cached sessions, {have[0]} .. {have[-1]}")
+    print(f"fitted on {len(train)} sessions before {window_start}, "
+          f"{cfg.signal.width_points:.0f}-point wings at {args.at}\n")
+
+    clock = _time.fromisoformat(args.at)
+    parent = [cfg.data.parent_symbol]
+    context = {}
+    for day in have:
+        defs, _ = fetcher.fetch(SCHEMA_DEFINITION, day, parent,
+                                cfg.data.quote_start, cfg.data.quote_end, "parent")
+        contracts = contracts_from_definitions(defs, cfg.data.underlying_root, day)
+        lo, hi = session_bounds(day, cfg.data.quote_start, cfg.data.quote_end)
+        frame, _ = fetcher.fetch_window(
+            dataset=cfg.data.dataset, schema=SCHEMA_VALIDATION_QUOTES,
+            symbols=parent, lo=lo, hi=hi, stype_in="parent", key_day=day,
+        )
+        wanted = {c.raw for c in contracts}
+        observed = state_at(by_day[day], clock, profile, baseline.prior_for(day))
+        if contracts and observed:
+            context[day] = (contracts, QuoteBook(frame[frame["symbol"].isin(wanted)]),
+                            observed[0])
+
+    if not context:
+        print("no session could be prepared")
+        return 1
+
+    # Breakeven belongs against the breach rate the model actually achieved,
+    # not the one it claims: it runs conservative, and judging a credit against
+    # the nominal figure rejects spreads that are in fact fairly priced.
+    measured = measured_breach_rates(model, held_out, profile, SWEEP_CONFIDENCES,
+                                     stride=args.stride, baseline=baseline)
+
+    width = cfg.signal.width_points
+    commission = 2 * cfg.execution.per_leg_cost / cfg.execution.contract_multiplier
+    print(f"  {'conf':>5s} {'OTM':>6s} {'breach':>7s} {'B/E':>6s} "
+          f"{'mid':>6s} {'cross':>6s} {'edge@mid':>9s} {'edge@cross':>11s}")
+    for confidence in SWEEP_CONFIDENCES:
+        z = model.close_quantile(1.0 - confidence)
+        checks, otm = [], []
+        for day, (contracts, book, state) in context.items():
+            check = check_session(
+                day, contracts, book, pd.Timestamp(f"{day} {args.at}", tz=ETZ),
+                z * state.sigma_remaining, args.side, width,
+                cfg.data.risk_free_rate, cfg.data.dividend_yield,
+            )
+            checks.append(check)
+            if not check.note:
+                otm.append(abs(check.spot - check.short_strike))
+        summary = ValidationSummary(checks, confidence)
+        if not summary.tradable:
+            print(f"  {confidence:>5.0%} {'--':>6s}  no tradable spread")
+            continue
+
+        breach = measured[confidence]
+        breakeven = width * breach
+        mid = _median_of([c.credit_mid for c in summary.tradable])
+        cross = summary.median_credit
+        print(f"  {confidence:>5.0%} {sum(otm)/len(otm):>6.0f} {breach:>7.1%} "
+              f"{breakeven:>6.2f} {mid:>6.2f} {cross:>6.2f} "
+              f"{mid - breakeven - commission:>+9.2f} "
+              f"{cross - breakeven - commission:>+11.2f}")
+
+    print(f"\n  Breach is what this model actually did on {len(held_out)} held-out")
+    print("  sessions, not what it claims. B/E is the credit that breaks even")
+    print("  against it. Edge is net of commission; positive means the market")
+    print("  paid more than the risk was worth at that strike.")
+    print("\n  mid is not a fillable price. The gap between the two edges is the")
+    print("  cost of crossing, and it decides whether better execution could")
+    print("  rescue a negative result or whether nothing can.")
+    return 0
+
+
+def _median_of(values: list[float]) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return float("nan")
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
 def cmd_cache(args) -> int:
     cfg = _configure(args)
     cache = ParquetCache(cfg.data.cache_dir)
@@ -581,6 +718,17 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--side", choices=["put", "call"], default="put")
     v.add_argument("--stride", type=int, default=5)
     v.set_defaults(func=cmd_validate)
+
+    w = sub.add_parser("sweep", parents=[common],
+                       help="edge across the confidence curve, on cached sessions")
+    w.add_argument("--train-start", required=True)
+    w.add_argument("--start", required=True, help="first held-out session")
+    w.add_argument("--end", required=True)
+    w.add_argument("--at", default="11:00")
+    w.add_argument("--side", choices=["put", "call"], default="put")
+    w.add_argument("--width", type=float, help="wing width in index points")
+    w.add_argument("--stride", type=int, default=5)
+    w.set_defaults(func=cmd_sweep)
 
     k = sub.add_parser("cache", parents=[common], help="what is cached and what it cost")
     k.add_argument("--limit", type=int, default=30)

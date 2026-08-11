@@ -64,6 +64,12 @@ class SpreadCheck:
     settlement: float | None
     breached: bool | None
     note: str = ""
+    # The same spread marked at both midpoints. Not a tradable price -- nobody
+    # is obliged to fill there -- but the gap between this and ``credit`` is
+    # what crossing the book costs, which separates "the market does not pay
+    # enough" from "the execution is eating it". Only the first of those is
+    # fatal; the second is a problem you can work on.
+    credit_mid: float = 0.0
 
     @property
     def wing_width(self) -> float:
@@ -174,6 +180,7 @@ def check_session(
     # marked at a midpoint: the whole point of spending on real quotes is to
     # find out what a taker would have received.
     credit = short_quote.bid - long_quote.ask
+    credit_mid = short_quote.mid - long_quote.mid
 
     settlement = _settlement(book, contracts, day, r)
     if settlement is None:
@@ -188,6 +195,7 @@ def check_session(
         day=day, entry_ts=entry_ts, side=side, spot=spot, model_level=level,
         short_strike=short.strike, long_strike=long_leg.strike,
         credit=credit, settlement=settlement, breached=breached,
+        credit_mid=credit_mid,
     )
 
 
