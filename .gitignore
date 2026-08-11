@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.venv/
+venv/
+
+# Market data is licensed and large; re-fetch with `tqsq fetch`.
+data/raw/*.dbn.zst
+data/raw/*.parquet
+
+# Live state and order intents carry position sizes.
+state.json
+intents.json
+bars.json
+.env
