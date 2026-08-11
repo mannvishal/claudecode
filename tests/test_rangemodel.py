@@ -553,3 +553,40 @@ class TestMeasuredBreachRates:
         model = RangeModel.fit(train, profile, stride=30)
         rows = calibration(model, test, profile, 30, None, (0.123, 0.456))
         assert sorted(r.alpha for r in rows) == [0.123, 0.456]
+
+
+class TestTruncatedStreams:
+    """A stream that dies mid-download carries no HTTP status.
+
+    The SDK raises a bare BentoError, so the 5xx rule does not see it and a
+    multi-hundred-megabyte chain pull that drops at 90% would abandon every
+    remaining session. Nothing partial is cached -- the write happens after the
+    call returns -- so retrying is safe.
+    """
+
+    def test_a_truncated_stream_is_transient(self):
+        from backtest.source import is_transient
+        from databento.common.error import BentoError
+
+        assert is_transient(BentoError("Error streaming response: Response ended prematurely"))
+
+    def test_connection_failures_are_transient(self):
+        from backtest.source import is_transient
+        from databento.common.error import BentoError
+
+        for msg in ("Connection reset by peer", "Connection aborted",
+                    "Read timed out", "IncompleteRead(1024 bytes)"):
+            assert is_transient(BentoError(msg)), msg
+
+    def test_a_genuine_argument_error_is_not_transient(self):
+        from backtest.source import is_transient
+        from databento.common.error import BentoError
+
+        assert not is_transient(BentoError("unknown schema 'mbp-1'"))
+        assert not is_transient(ValueError("bad strike"))
+
+    def test_a_402_is_still_not_transient(self):
+        """Message matching must not accidentally rescue a billing refusal."""
+        from backtest.source import is_transient
+
+        assert not is_transient(_client_error(402))

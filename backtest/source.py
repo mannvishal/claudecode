@@ -160,6 +160,21 @@ def definition_bounds(day: date) -> tuple[pd.Timestamp, pd.Timestamp]:
     return lo, lo + pd.Timedelta(days=1)
 
 
+# Failures that report no HTTP status because the connection, not the request,
+# is what broke. Matched on the message because the SDK raises a bare
+# ``BentoError`` for all of them.
+TRANSIENT_PHRASES = (
+    "ended prematurely",
+    "streaming response",
+    "connection reset",
+    "connection aborted",
+    "timed out",
+    # http.client spells it without a space; keep both so neither slips past.
+    "incompleteread",
+    "incomplete read",
+)
+
+
 def is_transient(exc: Exception) -> bool:
     """Whether a failed request is worth repeating.
 
@@ -171,7 +186,12 @@ def is_transient(exc: Exception) -> bool:
     if isinstance(exc, (ConnectionError, TimeoutError)):
         return True
     status = getattr(exc, "http_status", None)
-    return isinstance(status, int) and 500 <= status < 600
+    if isinstance(status, int):
+        return 500 <= status < 600
+    # A truncated stream carries no status at all: the request was accepted and
+    # the connection died mid-download. Multi-hundred-megabyte chain pulls hit
+    # this, and treating it as fatal throws away every session after it.
+    return any(phrase in str(exc).lower() for phrase in TRANSIENT_PHRASES)
 
 
 def with_retry(call, attempts: int = 5, base_delay: float = 2.0, echo=print):
